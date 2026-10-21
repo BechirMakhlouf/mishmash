@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test, { type TestContext } from 'node:test';
@@ -10,7 +10,7 @@ import { discoverSkills } from '../src/canonical.js';
 import type { Adapter, Context, JsonObject, Scope } from '../src/types.js';
 
 async function fixture(t: TestContext, scope: Scope = 'project'): Promise<Context> {
-  const root = await mkdtemp(path.join(os.tmpdir(), 'mishmash-adapters-a-'));
+  const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'mishmash-adapters-a-')));
   t.after(() => rm(root, { recursive: true, force: true }));
   const project = path.join(root, 'project');
   const home = path.join(root, 'home');

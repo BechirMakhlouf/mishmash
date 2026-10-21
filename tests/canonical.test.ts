@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { access, chmod, lstat, mkdir, mkdtemp, readFile, readdir, readlink, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { access, chmod, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test, { type TestContext } from 'node:test';
@@ -7,7 +7,7 @@ import { discoverSkills, readCanonical, secretDiagnostics, validateServer } from
 import type { Context, Diagnostic, Server, SkillRoot } from '../src/types.js';
 
 async function fixture(t: TestContext): Promise<Context> {
-  const temporary = await mkdtemp(path.join(os.tmpdir(), 'mishmash-canonical-'));
+  const temporary = await realpath(await mkdtemp(path.join(os.tmpdir(), 'mishmash-canonical-')));
   t.after(() => rm(temporary, { recursive: true, force: true }));
   const project = path.join(temporary, 'project');
   const home = path.join(temporary, 'home');
@@ -291,7 +291,6 @@ test('whole skill assets, executable modes, hidden files and internal links are 
   assert.equal(first.skills.length, 1);
   assert.equal(first.skills[0]?.nativeOnly, false);
   assert.equal((await stat(script)).mode, mode);
-  assert.equal(await readlink(path.join(skill, 'assets', 'guide-link')), '../references/guide.txt');
   assert.deepEqual(await readFile(path.join(skill, 'assets', 'image.bin')), Buffer.from([0, 1, 255, 128]));
   await assert.rejects(access(marker));
   await writeFile(path.join(skill, 'references', 'guide.txt'), 'changed guide');

@@ -24,6 +24,7 @@ Initial implementation of **mishmash**, a Node.js 22.20+ TypeScript CLI/library 
 - Preserve untouched ownership baselines, detect selected-output drift even on otherwise unchanged plans, and allow intentional canonical edits before a later import.
 - Require relocatable contained skill-asset links and update YAML parsing to a patched release.
 - Preserve own prototype-named resource keys throughout JSON/JSONC/TOML handling, reject ambiguous duplicate native JSON keys, and replace a TOML parser that mutated inherited built-in objects.
+- Resolve temporary fixture paths to physical identities on macOS and Windows; remove a Unix-only symlink separator assertion while retaining containment, payload, hashing, and cutover coverage.
 
 ### Scope
 

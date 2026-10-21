@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, writeFile, readFile, readdir, rm, chmod, stat, lstat } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, readFile, readdir, realpath, rm, chmod, stat, lstat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -10,7 +10,7 @@ import { readDocument, patchDocument } from '../src/documents.js';
 import type { Context, Plan } from '../src/types.js';
 
 async function fixture(t: { after: (fn: () => Promise<void>) => void }, scope: Context['scope'] = 'project') {
-  const root = await mkdtemp(path.join(tmpdir(), 'mishmash-core-'));
+  const root = await realpath(await mkdtemp(path.join(tmpdir(), 'mishmash-core-')));
   t.after(() => rm(root, { recursive: true, force: true }));
   const project = path.join(root, 'project'), home = path.join(root, 'home');
   await mkdir(project); await mkdir(home);
