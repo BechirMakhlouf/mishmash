@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/BechirMakhlouf/mishmash/blob/main/schemas/mcp.schema.json",
+  "title": "mishmash MCP intent version 1",
+  "type": "object", "required": ["version", "mcpServers"], "additionalProperties": false,
+  "properties": { "version": { "const": 1 }, "mcpServers": { "type": "object", "additionalProperties": { "$ref": "#/$defs/server" } } },
+  "$defs": {
+    "value": { "oneOf": [{ "type": "string" }, { "type": "object", "required": ["env"], "additionalProperties": false, "properties": { "env": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" } } }] },
+    "values": { "type": "object", "additionalProperties": { "$ref": "#/$defs/value" } },
+    "cwd": { "type": "object", "required": ["base", "path"], "additionalProperties": false, "properties": { "base": { "enum": ["project", "home", "source"] }, "path": { "type": "string" } } },
+    "server": { "oneOf": [
+      { "type": "object", "required": ["type", "command"], "additionalProperties": false, "properties": { "type": { "const": "stdio" }, "command": { "type": "string", "minLength": 1 }, "args": { "type": "array", "items": { "type": "string" } }, "env": { "$ref": "#/$defs/values" }, "cwd": { "$ref": "#/$defs/cwd" } } },
+      { "type": "object", "required": ["type", "url"], "additionalProperties": false, "properties": { "type": { "enum": ["streamable-http", "sse"] }, "url": { "type": "string", "format": "uri" }, "headers": { "$ref": "#/$defs/values" } } }
+    ] }
+  }
+}
