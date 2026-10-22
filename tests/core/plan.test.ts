@@ -96,7 +96,7 @@ it('plans complete copy trees with binary assets, empty directories, executable 
   const binary = operations.find(operation => operation.kind === 'write' && operation.path.endsWith('/assets/bytes.bin'));
   expect(binary?.kind === 'write' && binary.content.kind === 'source' && binary.content.snapshot.kind === 'file').toBe(true);
   const nestedLink = operations.find(operation => operation.kind === 'symlink' && operation.path.endsWith('/scripts/inspect-link'));
-  const outerLink = operations.find(operation => operation.kind === 'symlink' && operation.path.endsWith('/inspect-link'));
+  const outerLink = operations.find(operation => operation.kind === 'symlink' && operation.path.endsWith('/whole-tree/inspect-link'));
   expect(nestedLink?.kind === 'symlink' && nestedLink.target === 'inspect.sh').toBe(true);
   expect(outerLink?.kind === 'symlink' && outerLink.target === 'scripts/inspect-link').toBe(true);
   expect(operations.indexOf(nestedLink!) < operations.indexOf(outerLink!)).toBe(true);
