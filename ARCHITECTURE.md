@@ -151,6 +151,8 @@ Make original data and journal intent durable before changing originals. Track f
 
 A global mishmash apply lock serializes mishmash writers and ownership updates, not external editors. Preconditions detect stale reviews and narrow races; they do not provide isolation against arbitrary concurrent processes. Rollback must not overwrite a new external edit: preserve recovery data, report a pending recovery, and block another apply until an explicit recovery decision.
 
+The apply lock is protected by a short-lived exclusive sibling guard during acquisition/reclamation; an owner-verified release never removes a replacement lock. A stranded, corrupt or unknown-owner guard blocks writes and is surfaced at its exact path. Do not auto-delete it: stop all mishmash writers, verify the recorded owner is inactive, then follow the documented recovery procedure. Reclaim a dead apply lock only through explicit recovery approval. Missing XDG state roots are created with private permissions only after confirmation; false confirmation and read-only planning create none. Completed journals remain available for backup/recovery history but no longer require their former project root to exist.
+
 Before apply, cancellation performs no writes. During apply, catchable cancellation requests safe settlement/recovery; do not call `process.exit()` in the middle of a write. On the next run, surface an interrupted journal before another apply. Do not claim a no-write cancellation if mutation began.
 
 ## 7. Clack interaction and process lifecycle
