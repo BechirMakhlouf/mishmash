@@ -43,7 +43,7 @@ Share the standard skill reader across native adapters and explicitly supplied s
 | --- | --- |
 | `Context` | Approved project/home/XDG roots, explicit placement/configuration scope, and cancellation signal where applicable |
 | `SourceRef` | Exact native/shared source location, agent associations, logical project/user scope and private/shared visibility |
-| `ResourceInstance` | Stable ID derived from source identity plus skill-relative path or MCP registration locator; includes name, description when present and provenance |
+| `ResourceInstance` | Stable ID from source identity plus skill-relative path or MCP registration locator **and, when parser semantics differ, native-agent interpretation**; includes description and provenance |
 | `Snapshot` | Separate content/tree fingerprint, entry types, supported modes, link targets and resolved parent identity |
 | `AuthoritySelection` | Explicit mapping from selected resources/conflicts to exact source instances; never infer authority from list order, timestamp or `.agents` |
 | `DestinationSlot` | Resolved physical path plus registration key when several resources share a configuration file |
@@ -51,7 +51,7 @@ Share the standard skill reader across native adapters and explicitly supplied s
 | `Plan` | Selected authorities, operations, resolved scopes/paths, warnings/blockers, expected snapshots and metadata write intents |
 | `ApplyResult` | Changed/unchanged/skipped resources and destinations, backup location, recovery status and safe findings |
 
-Resource identity is not a display name or content hash. A `SourceRef.id` is the normalized resolved source path plus logical scope and visibility; it excludes the discovering agent and label. Native adapters realpath existing source roots/configs before constructing `SourceRef`, while `CheckedLocation` retains the configured alias. Shared roots use `agentId: 'shared'` and retain detecting agents in provenance; compatibility paths retain their native owner. Same-name resources at different source identities remain separate; one physical source discovered by several agents is one instance with all provenance.
+Resource identity is not a display name or content hash. A `SourceRef.id` is the normalized resolved source path plus logical scope and visibility; it excludes the discovering agent and label. Native adapters realpath existing source roots/configs before constructing `SourceRef`, while `CheckedLocation` retains the configured alias. Shared skill roots use `agentId: 'shared'` and retain detecting agents in provenance; compatibility paths retain their native owner. Identical physical skills discovered via several adapters coalesce into one resource with all provenance. A shared MCP file can have agent-specific interpretation semantics; preserve those as distinct resource views when `nativeAgent` changes, even though the physical `SourceRef` is shared. Same-name resources at different sources or semantic interpretations remain distinct until explicit authority resolves them.
 
 Logical scope is not determined solely by file location: a project-private MCP entry may be stored under the home directory. Do not flatten user resources into project resources. Unclassified privacy must not become permission to publish globally.
 
