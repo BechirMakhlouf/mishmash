@@ -326,4 +326,35 @@ describe('applyPlan', () => {
     expect((await applyPlan(reviewed, { confirmed: true })).status).toBe('blocked');
     expect(snapshotsEqual(before, await snapshotPath(root))).toBe(true);
   });
+
+  it('copies contained links with intermediate symlink expansion before parent traversal', async () => {
+    const { context } = await sandbox();
+    const source = join(context.projectRoot, 'source');
+    const output = join(context.projectRoot, 'output');
+    const binary = Uint8Array.from([0, 255, 128, 42]);
+    await putFile(join(source, 'sub', 'b'), binary, 0o640);
+    await mkdir(join(source, 'sub', 'deep'));
+    await symlink('sub/deep', join(source, 'dir'));
+    await symlink('dir/../b', join(source, 'a'));
+    await symlink('a', join(source, 'b'));
+    const before = await snapshotPath(source);
+    const operations: Operation[] = [
+      await directory(output),
+      await directory(join(output, 'sub')),
+      await directory(join(output, 'sub', 'deep')),
+      await copy(join(source, 'sub', 'b'), join(output, 'sub', 'b'), 0o640),
+      await link(join(output, 'dir'), 'sub/deep'),
+      await link(join(output, 'a'), 'dir/../b'),
+      await link(join(output, 'b'), 'a'),
+    ];
+    const result = await applyPlan(plan(context, operations, [before]), { confirmed: true });
+    expect(result.status).toBe('applied');
+    expect(await readlink(join(output, 'dir'))).toBe('sub/deep');
+    expect(await readlink(join(output, 'a'))).toBe('dir/../b');
+    expect(await readlink(join(output, 'b'))).toBe('a');
+    expect(await bytesEqual(join(output, 'a'), binary)).toBe(true);
+    expect(await bytesEqual(join(output, 'b'), binary)).toBe(true);
+    expect((await snapshotPath(join(output, 'a'))).resolvedPath).toBe(join(output, 'sub', 'b'));
+    expect(snapshotsEqual(before, await snapshotPath(source))).toBe(true);
+  });
 });

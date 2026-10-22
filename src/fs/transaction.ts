@@ -315,7 +315,9 @@ export async function prepareOperation(operation: Operation, before: PathSnapsho
   } else return { ...before, kind: 'missing', digest: 'missing', mode: 0, entries: [], linkTarget: undefined, resolvedPath: physicalPath };
   await syncDirectory(stage);
   const after = await snapshotPath(payload);
-  const resolvedPath = operation.kind === 'symlink' ? await resolvePhysical(resolve(parent, operation.target)) : physicalPath;
+  // Preserve the target text until the filesystem expands any intermediate links;
+  // lexical normalization would incorrectly collapse a link component followed by '..'.
+  const resolvedPath = operation.kind === 'symlink' ? await resolvePhysical(isAbsolute(operation.target) ? operation.target : `${parent}/${operation.target}`) : physicalPath;
   return { ...after, path: operation.path, parents: before.parents, resolvedPath };
 }
 export async function mutate(operation: Operation, stage: string): Promise<void> {
