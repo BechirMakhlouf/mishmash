@@ -91,10 +91,12 @@ export function renderDiscoverySummary(inventory: Inventory): string[] {
   lines.push('Resources:');
   if (inventory.resources.length) lines.push(...inventory.resources.map(renderResourceLine));
   else lines.push('  No skills or MCP registrations found.');
-  lines.push('Checked locations:');
-  if (inventory.checkedLocations.length) {
-    for (const location of inventory.checkedLocations) lines.push(`  ${checkedLocationLine(location)}`);
-  } else lines.push('  No locations were checked.');
+  if (!inventory.resources.length || inventory.findings.length) {
+    lines.push('Checked locations:');
+    if (inventory.checkedLocations.length) {
+      for (const location of inventory.checkedLocations) lines.push(`  ${checkedLocationLine(location)}`);
+    } else lines.push('  No locations were checked.');
+  }
   if (inventory.findings.length) lines.push(`Discovery findings: ${inventory.findings.length} · review details before applying.`);
   return lines;
 }
@@ -145,7 +147,7 @@ export function renderPlanReview(plan: Plan, state: LoadedState, checkedCount: n
   return lines;
 }
 
-export function renderPlanDetails(plan: Plan, inventoryResources: readonly ResourceInstance[] = []): string[] {
+export function renderPlanDetails(plan: Plan, inventoryResources: readonly ResourceInstance[] = [], checkedLocations: readonly CheckedLocation[] = []): string[] {
   const lines = ['Plan details:'];
   for (const operation of plan.operations) {
     lines.push(`  ${operation.kind} · ${sanitizeTerminalText(operation.description)} · ${sanitizeTerminalText(operation.path)}${operation.purpose === 'state' ? ' · generated state' : ''}`);
@@ -159,6 +161,10 @@ export function renderPlanDetails(plan: Plan, inventoryResources: readonly Resou
     lines.push(`  ${resource.kind} · ${short(resource.name, 80) ?? '(unnamed)'}${interpretation}`);
   }
   if (!plan.summary.resources.length) lines.push('  No authoritative resources resolved.');
+  if (checkedLocations.length) {
+    lines.push('Checked locations:');
+    for (const location of checkedLocations) lines.push(`  ${checkedLocationLine(location)}`);
+  }
   lines.push('Findings:');
   if (plan.findings.length) lines.push(...plan.findings.map(finding => `  ${renderFinding(finding)}`));
   else lines.push('  None.');

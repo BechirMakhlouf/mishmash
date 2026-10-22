@@ -648,7 +648,7 @@ async function reviewPlan(
   });
   if (checkCancelled(action) || action === 'cancel') return 'cancelled';
   if (action === 'details') {
-    log.message(renderPlanDetails(plan, inventory.resources));
+    log.message(renderPlanDetails(plan, inventory.resources, inventory.checkedLocations));
     return undefined;
   }
   if (action === 'edit') return 'edit';
