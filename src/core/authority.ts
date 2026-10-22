@@ -10,8 +10,7 @@ export function authorityKey(resource: ResourceInstance): string {
 }
 
 function sameSource(a: SourceRef, b: SourceRef): boolean {
-  return a.id === b.id && a.path === b.path && a.agentId === b.agentId
-    && a.scope === b.scope && a.visibility === b.visibility;
+  return a.id === b.id && a.path === b.path && a.scope === b.scope && a.visibility === b.visibility;
 }
 
 /**

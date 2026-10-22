@@ -4,9 +4,10 @@ import { parseDocument } from 'yaml';
 import type { AgentId, Finding, Scope, SkillResource, SourceRef, Visibility } from '../model.js';
 import { errorCode, filesystemFinding, isWithin, snapshotMatches, snapshotPath } from '../fs/snapshot.js';
 
+/** Source identity is the resolved location and logical scope, not its discovering agent or label. */
 export function sourceRef(agentId: AgentId | 'shared', path: string, scope: Scope, visibility: Visibility, label: string): SourceRef {
   const absolute = resolve(path);
-  return { id: JSON.stringify([agentId, scope, absolute]), agentId, path: absolute, scope, visibility, label };
+  return { id: JSON.stringify([absolute, scope, visibility]), agentId, path: absolute, scope, visibility, label };
 }
 export function resourceId(source: SourceRef, locator: string): string { return JSON.stringify([source.id, locator]); }
 export interface SkillReadResult { resources: readonly SkillResource[]; findings: readonly Finding[] }

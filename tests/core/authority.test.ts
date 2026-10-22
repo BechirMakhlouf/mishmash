@@ -246,3 +246,15 @@ it('keeps skill and MCP authority namespaces separate for actual same-named sour
   expect(resolved.resources).toHaveLength(2);
   expect(resolved.choices.resourceAuthorities).toEqual({ 'skill:review': skills.resources[0]!.id, 'mcp:review': mcp.id });
 });
+
+it('does not treat a shared-directory agent association change as a new authority location', async () => {
+  const { inventory, native } = await divergentSources();
+  const remembered = resolveAuthority(inventory, resolveSelection(inventory, [native.id]), {}).choices;
+  const sharedView: SourceRef = { ...native.source, id: sourceRef('shared', native.source.path, 'project', 'private', 'Shared location').id, agentId: 'shared', agents: ['claude-code', 'codex'] };
+  const currentResource = { ...native, source: sharedView };
+  const current: Inventory = { ...inventory, resources: [currentResource], sources: [sharedView] };
+  const resolution = resolveAuthority(current, resolveSelection(current, [currentResource.id]), {}, remembered);
+  expect(resolution.findings).toEqual([]);
+  expect(resolution.resources).toEqual([currentResource]);
+  expect(resolution.choices.sources).toEqual([sharedView]);
+});
