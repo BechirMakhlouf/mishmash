@@ -107,7 +107,7 @@ async function loadState(context: Context, configuration: ConfigurationScope): P
   return state;
 }
 
-async function includeRememberedSharedSources(context: Context, scopes: readonly ConfigurationScope[]): Promise<Context> {
+export async function includeRememberedSharedSources(context: Context, scopes: readonly ConfigurationScope[]): Promise<Context> {
   const states = await Promise.all(scopes.map(scope => readState(context, scope).catch(() => undefined)));
   const existingIds = new Set((context.extraSources ?? []).map(source => source.id));
   const candidates = new Map<string, SourceRef>();
@@ -119,14 +119,7 @@ async function includeRememberedSharedSources(context: Context, scopes: readonly
       candidates.set(source.id, existing ? { ...existing, agents } : source);
     }
   }
-  const remembered: SourceRef[] = [];
-  for (const source of candidates.values()) {
-    try {
-      if ((await stat(source.path)).isDirectory()) remembered.push(source);
-    } catch {
-      // Missing or unreadable roots remain visible through the selected state's authority findings.
-    }
-  }
+  const remembered = [...candidates.values()];
   return remembered.length ? { ...context, extraSources: [...(context.extraSources ?? []), ...remembered] } : context;
 }
 

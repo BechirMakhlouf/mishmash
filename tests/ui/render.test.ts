@@ -1,10 +1,18 @@
-import { expect, it } from 'vitest';
-import type { ApplyResult, Context, Inventory, LoadedState, McpResource, PathSnapshot, Plan, SkillResource, SourceRef } from '../../src/model.js';
+import { afterEach, expect, it } from 'vitest';
+import { join } from 'node:path';
+import type { ApplyResult, AuthorityConfig, Context, Inventory, LoadedState, McpResource, PathSnapshot, Plan, SkillResource, SourceRef } from '../../src/model.js';
 import {
   renderApplyResult, renderDiscoverySummary, renderPlanDetails, renderPlanReview,
   renderResourceLabel, renderSourceLabel, renderAuthorityName, sanitizeTerminalText,
 } from '../../src/ui/render.js';
-import { withClackSpinnerExitAbort } from '../../src/ui/flow.js';
+import { discover } from '../../src/core/discover.js';
+import { encodeAuthorityConfig, getStatePaths } from '../../src/state.js';
+import { sourceRef } from '../../src/resources/skills.js';
+import { createSandbox, putFile, type Sandbox } from '../helpers/sandbox.js';
+import { includeRememberedSharedSources, withClackSpinnerExitAbort } from '../../src/ui/flow.js';
+
+let sandbox: Sandbox | undefined;
+afterEach(async () => { await sandbox?.cleanup(); });
 
 const context: Context = {
   projectRoot: '/project',
@@ -189,4 +197,19 @@ it('keeps credential-bearing MCP definitions and bodies out of safe review proje
   expect(projections).not.toContain('Authorization');
   expect(projections).not.toContain('run-server');
   expect(projections).not.toMatch(/[\u001b\u009b\u009d\u0000-\u001f\u007f-\u009f\u202a-\u202e]/);
+});
+
+it('keeps a missing remembered shared source in discovery findings without substituting another root', async () => {
+  sandbox = await createSandbox();
+  const missingRoot = join(sandbox.context.projectRoot, 'remembered-skills');
+  const remembered = sourceRef('shared', missingRoot, 'project', 'shared', 'Remembered shared skills');
+  const paths = await getStatePaths(sandbox.context, 'private-project');
+  const choices: AuthorityConfig = { version: 1, sources: [remembered], resourceAuthorities: {} };
+  await putFile(paths.preferencePath, encodeAuthorityConfig(choices));
+
+  const discoveryContext = await includeRememberedSharedSources(sandbox.context, ['private-project']);
+  expect(discoveryContext.extraSources).toContainEqual(remembered);
+  const inventory = await discover(discoveryContext);
+  expect(inventory.checkedLocations.some(location => location.path === missingRoot && !location.exists)).toBe(true);
+  expect(inventory.findings.some(finding => finding.code === 'MISSING_EXTRA_SOURCE' && finding.path === missingRoot)).toBe(true);
 });
