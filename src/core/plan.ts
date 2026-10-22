@@ -1,4 +1,4 @@
-import { lstat, readFile, realpath } from 'node:fs/promises';
+import { lstat, readFile, realpath, stat } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, relative, resolve, sep } from 'node:path';
 import type { NativeAdapter, PreparedFileEdit, PreparedMcpTarget } from '../agents/contract.js';
 import { nativeAdapters } from '../agents/index.js';
@@ -73,6 +73,20 @@ async function resolvedParent(path: string): Promise<string> {
       const parent = dirname(current);
       if (parent === current) throw error;
       suffix.unshift(relative(parent, current));
+      current = parent;
+    }
+  }
+}
+async function nearestExistingDirectory(path: string): Promise<string> {
+  let current = dirname(resolve(path));
+  for (;;) {
+    try {
+      if (!(await stat(current)).isDirectory()) throw new Error('The existing configuration ancestor is not a directory.');
+      return resolve(await realpath(current));
+    } catch (error) {
+      if (errorCode(error) !== 'ENOENT' && errorCode(error) !== 'ENOTDIR') throw error;
+      const parent = dirname(current);
+      if (parent === current) throw error;
       current = parent;
     }
   }
@@ -198,13 +212,14 @@ function orderOperations(operations: readonly Operation[], findings: Finding[]):
   const result: Operation[] = [];
   for (const purpose of ['resource', 'state'] as const) {
     const group = operations.filter(operation => operation.purpose === purpose);
-    result.push(...group.filter(operation => operation.kind !== 'symlink').sort(compareOperations));
+    result.push(...group.filter(operation => operation.kind !== 'symlink' && operation.kind !== 'remove').sort(compareOperations));
     const pending = new Map(group.filter((operation): operation is Extract<Operation, { kind: 'symlink' }> => operation.kind === 'symlink')
       .map(operation => [resolve(operation.path), operation]));
     while (pending.size) {
-      const ready = [...pending.entries()].filter(([, operation]) =>
-        !pending.has(resolve(dirname(operation.path), operation.target)))
-        .sort(([a], [b]) => a.localeCompare(b));
+      const ready = [...pending.entries()].filter(([, operation]) => {
+        const target = resolve(dirname(operation.path), operation.target);
+        return ![...pending.keys()].some(path => isWithin(path, target));
+      }).sort(([a], [b]) => a.localeCompare(b));
       if (!ready.length) {
         const path = [...pending.keys()].sort()[0]!;
         findings.push(issue('SKILL_LINK_CYCLE', 'Planned skill links contain a dependency cycle.', path));
@@ -216,21 +231,24 @@ function orderOperations(operations: readonly Operation[], findings: Finding[]):
         pending.delete(path);
       }
     }
+    result.push(...group.filter(operation => operation.kind === 'remove').sort(compareOperations));
   }
   return result;
 }
 
-async function addDirsForDestination(builder: PlanBuilder, directory: string, boundary: string, expectedByPath: Map<string, PathSnapshot>, resourceIds: readonly string[], purpose: 'resource' | 'state' = 'resource', directoryMode = 0o755): Promise<void> {
+async function addDirsForDestination(builder: PlanBuilder, directory: string, boundary: string, expectedByPath: Map<string, PathSnapshot>, resourceIds: readonly string[], purpose: 'resource' | 'state' = 'resource', directoryMode = 0o755, includeBoundaryParents = false): Promise<void> {
   const missing: { path: string; snapshot: PathSnapshot }[] = [];
   let current = resolve(directory);
   const root = resolve(boundary);
-  while (isWithin(root, current)) {
+  const rootSnapshot = includeBoundaryParents ? await snapshotPath(root) : undefined;
+  const traversalRoot = rootSnapshot?.kind === 'missing' ? await nearestExistingDirectory(root) : root;
+  while (isWithin(traversalRoot, current)) {
     const snapshot = expectedByPath.get(current) ?? await snapshotPath(current);
     builder.addPrecondition(snapshot);
     if (snapshot.kind === 'directory') break;
     if (snapshot.kind !== 'missing') break;
     missing.push({ path: current, snapshot });
-    if (current === root) break;
+    if (current === traversalRoot) break;
     const parent = dirname(current);
     if (parent === current) break;
     current = parent;
@@ -340,7 +358,7 @@ async function skillPlan(
         return;
       }
       builder.addPrecondition(parentCheck.snapshot);
-      await addDirsForDestination(builder, parent, roots.find(root => isWithin(root, parent)) ?? roots[0]!, new Map([[parent, parentCheck.snapshot]]), [resource.id], 'resource', directoryMode);
+      await addDirsForDestination(builder, parent, roots.find(root => isWithin(root, parent)) ?? roots[0]!, new Map([[parent, parentCheck.snapshot]]), [resource.id], 'resource', directoryMode, directoryMode === 0o700);
       builder.addOperation({ kind: 'symlink', path: target, expected: current, target: desiredLink,
         resourceIds: [resource.id], purpose: 'resource', description: `Link skill ${resource.name} to its authoritative source.` });
       if (receipt) builder.updates++; else builder.additions++;
@@ -369,7 +387,7 @@ async function skillPlan(
         builder.addPrecondition(snapshot);
       }
     }
-    await addDirsForDestination(builder, parent, roots.find(root => isWithin(root, parent)) ?? roots[0]!, expectedByPath, [resource.id], 'resource', directoryMode);
+    await addDirsForDestination(builder, parent, roots.find(root => isWithin(root, parent)) ?? roots[0]!, expectedByPath, [resource.id], 'resource', directoryMode, directoryMode === 0o700);
     for (const entry of desiredEntries) {
       const path = entry.relativePath ? resolve(target, ...entry.relativePath.split('/')) : target;
       const expected = expectedByPath.get(path) ?? current;
@@ -684,7 +702,7 @@ async function prepareMcpDestination(
     if (boundary) {
       const directoryMode = destination.placement !== 'project' && privateConfigRoots.some(root => isWithin(root, parent)) ? 0o700 : 0o755;
       await addDirsForDestination(builder, parent, boundary,
-        new Map([[parent, parentCheck.snapshot], [path, expected]]), [...merged.resourceIds].sort(), 'resource', directoryMode);
+        new Map([[parent, parentCheck.snapshot], [path, expected]]), [...merged.resourceIds].sort(), 'resource', directoryMode, directoryMode === 0o700);
     }
     builder.addOperation({ kind: 'write', path: merged.path, expected, content: { kind: 'bytes', bytes: merged.edit.bytes }, mode: merged.edit.mode,
       resourceIds: [...merged.resourceIds].sort(), purpose: 'resource', description: `Update selected MCP registrations for ${destination.agentId}.` });
@@ -820,51 +838,60 @@ export async function planSync(
   try { statePaths = await getStatePaths(context, approvedRequest.configuration); }
   catch { builder.findings.push(issue('UNSAFE_STATE_PATH', 'The approved state location could not be resolved safely.')); }
   if (statePaths && !privateProjectMetadataBlocked) {
-    const expectedPreference = resolve(statePaths.preferencePath);
-    const expectedOwnership = resolve(statePaths.ownershipPath);
-    if (resolve(loadedState.preferencePath) !== expectedPreference || resolve(loadedState.ownershipPath) !== expectedOwnership) {
+    const preferenceAliasPath = resolve(statePaths.preferencePath);
+    const ownershipAliasPath = resolve(statePaths.ownershipPath);
+    if (resolve(loadedState.preferencePath) !== preferenceAliasPath || resolve(loadedState.ownershipPath) !== ownershipAliasPath) {
       builder.findings.push(issue('STATE_LOCATION_MISMATCH', 'Loaded preferences or ownership receipts do not match the approved configuration scope.'));
     }
-    const statePathsSnapshots = new Map(loadedState.snapshots.map(snapshot => [resolve(snapshot.path), snapshot]));
-    const preferenceSnapshot = statePathsSnapshots.get(expectedPreference);
-    const ownershipSnapshot = statePathsSnapshots.get(expectedOwnership);
-    if (!preferenceSnapshot || !ownershipSnapshot) builder.findings.push(issue('MISSING_STATE_PRECONDITION', 'The loaded state does not include snapshots for the approved metadata paths.'));
+    const loadedSnapshots = new Map(loadedState.snapshots.map(snapshot => [resolve(snapshot.path), snapshot]));
+    const preferenceLoaded = loadedSnapshots.get(preferenceAliasPath);
+    const ownershipLoaded = loadedSnapshots.get(ownershipAliasPath);
+    if (!preferenceLoaded || !ownershipLoaded) builder.findings.push(issue('MISSING_STATE_PRECONDITION', 'The loaded state does not include snapshots for the approved metadata paths.'));
     const preferencesRoot = approvedRequest.configuration === 'project' ? projectRoots : configRoots;
-    const preferenceSafe = await inspectScopedPath(expectedPreference, preferencesRoot);
-    const ownershipSafe = await inspectScopedPath(expectedOwnership, stateRoots);
-    if (!preferenceSafe.safe || !preferenceSafe.snapshot || !ownershipSafe.safe || !ownershipSafe.snapshot) {
+    const preferenceLocation = await inspectScopedPath(preferenceAliasPath, preferencesRoot);
+    const ownershipLocation = await inspectScopedPath(ownershipAliasPath, stateRoots);
+    if (!preferenceLocation.safe || !preferenceLocation.snapshot || !ownershipLocation.safe || !ownershipLocation.snapshot) {
       builder.findings.push(issue('UNSAFE_STATE_PATH', 'A state metadata path escapes its approved private or project scope.'));
     } else {
-      for (const loaded of [preferenceSnapshot, ownershipSnapshot]) {
-        if (loaded) {
-          if (!await snapshotMatches(loaded)) builder.findings.push(issue('STALE_STATE', 'Preferences or ownership receipts changed after they were read.', loaded.path));
-          builder.addPrecondition(loaded);
-        }
+      for (const loaded of [preferenceLoaded, ownershipLoaded]) {
+        if (loaded && !await snapshotMatches(loaded)) builder.findings.push(issue('STALE_STATE', 'Preferences or ownership receipts changed after they were read.', loaded.path));
       }
+      const preferencePath = await physicalEntryPath(preferenceAliasPath, preferenceLocation.snapshot);
+      const ownershipPath = await physicalEntryPath(ownershipAliasPath, ownershipLocation.snapshot);
+      const preferenceSnapshot = await snapshotPath(preferencePath);
+      const ownershipSnapshot = await snapshotPath(ownershipPath);
+      const samePhysicalState = (alias: PathSnapshot, physical: PathSnapshot): boolean => alias.kind === physical.kind
+        && alias.digest === physical.digest && alias.mode === physical.mode
+        && resolve(alias.resolvedPath) === resolve(physical.resolvedPath);
+      if (!samePhysicalState(preferenceLocation.snapshot, preferenceSnapshot)
+        || !samePhysicalState(ownershipLocation.snapshot, ownershipSnapshot)) {
+        builder.findings.push(issue('STALE_STATE', 'Preferences or ownership receipts changed while their physical paths were being resolved.'));
+      }
+      await addPhysicalPrecondition(builder, preferenceLocation.snapshot, preferenceSnapshot);
+      await addPhysicalPrecondition(builder, ownershipLocation.snapshot, ownershipSnapshot);
       const preferenceBytes = encodeAuthorityConfig(choiceConfig);
       const ownershipState = { version: 1 as const, receipts: [...nextReceipts.values()].sort((a, b) => a.slotId.localeCompare(b.slotId)) };
       const ownershipBytes = encodeOwnershipState(ownershipState);
-      const currentPreferenceBytes = preferenceSnapshot?.kind === 'file' ? await readFile(expectedPreference).catch(() => undefined) : undefined;
-      const currentOwnershipBytes = ownershipSnapshot?.kind === 'file' ? await readFile(expectedOwnership).catch(() => undefined) : undefined;
+      const currentPreferenceBytes = preferenceSnapshot.kind === 'file' ? await readFile(preferencePath).catch(() => undefined) : undefined;
+      const currentOwnershipBytes = ownershipSnapshot.kind === 'file' ? await readFile(ownershipPath).catch(() => undefined) : undefined;
       const preferenceDifferent = !currentPreferenceBytes || !sameBytes(currentPreferenceBytes, preferenceBytes);
       const ownershipDifferent = !currentOwnershipBytes || !sameBytes(currentOwnershipBytes, ownershipBytes);
-      const preferenceParent = dirname(expectedPreference);
-      const ownershipParent = dirname(expectedOwnership);
+      const preferenceParent = dirname(preferencePath);
+      const ownershipParent = dirname(ownershipPath);
       const preferenceParentSafe = await inspectScopedPath(preferenceParent, preferencesRoot);
       const ownershipParentSafe = await inspectScopedPath(ownershipParent, stateRoots);
-      if (preferenceDifferent && preferenceSnapshot && preferenceParentSafe.safe && preferenceParentSafe.snapshot) {
+      if (preferenceDifferent && preferenceParentSafe.safe && preferenceParentSafe.snapshot) {
         builder.addPrecondition(preferenceParentSafe.snapshot);
         const root = preferencesRoot.find(candidate => isWithin(candidate, preferenceParent)) ?? projectRoot;
-        const expectedByPath = new Map([[preferenceParent, preferenceParentSafe.snapshot], [expectedPreference, preferenceSnapshot]]);
+        const expectedByPath = new Map([[preferenceParent, preferenceParentSafe.snapshot], [preferencePath, preferenceSnapshot]]);
         await addDirsForDestination(builder, preferenceParent, root, expectedByPath, [], 'state',
-          approvedRequest.configuration === 'project' ? 0o755 : 0o700);
-        builder.addOperation({ kind: 'write', path: expectedPreference, expected: preferenceSnapshot,
+          approvedRequest.configuration === 'project' ? 0o755 : 0o700, approvedRequest.configuration !== 'project');
+        builder.addOperation({ kind: 'write', path: preferencePath, expected: preferenceSnapshot,
           content: { kind: 'bytes', bytes: preferenceBytes }, mode: 0o600, resourceIds: [], purpose: 'state', description: 'Record approved authority preferences.' });
       }
-      if (ownershipDifferent && ownershipSnapshot && ownershipParentSafe.safe && ownershipParentSafe.snapshot) {
+      if (ownershipDifferent && ownershipParentSafe.safe && ownershipParentSafe.snapshot) {
         builder.addPrecondition(ownershipParentSafe.snapshot);
-        const expectedByPath = new Map([[ownershipParent, ownershipParentSafe.snapshot], [expectedOwnership, ownershipSnapshot]]);
-        builder.addOperation({ kind: 'write', path: expectedOwnership, expected: ownershipSnapshot,
+        builder.addOperation({ kind: 'write', path: ownershipPath, expected: ownershipSnapshot,
           content: { kind: 'bytes', bytes: ownershipBytes }, mode: 0o600, resourceIds: [], purpose: 'state', description: 'Record synchronization ownership receipts.' });
       }
     }

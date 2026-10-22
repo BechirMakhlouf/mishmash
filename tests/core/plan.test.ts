@@ -1,6 +1,6 @@
 import { afterEach, expect, it } from 'vitest';
 import { cp, mkdir, readFile, readlink, rm, stat, symlink, writeFile } from 'node:fs/promises';
-import { dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import type { AgentId, AuthorityConfig, DestinationRequest, OwnershipState, ResourceInstance, SyncRequest } from '../../src/model.js';
 import { discover } from '../../src/core/discover.js';
 import { applyPlan } from '../../src/fs/apply.js';
@@ -445,6 +445,11 @@ it('applies skill copies through safe parent symlinks and bootstraps absent XDG 
 
 it('applies OpenCode user skills and private preferences under absent XDG roots with mode 0700', async () => {
   sandbox = await createSandbox();
+  const configParents = [
+    join(sandbox.root, 'missing-config-parent'),
+    join(sandbox.root, 'missing-config-parent', 'nested'),
+  ];
+  sandbox.context.configHome = join(configParents[1]!, 'xdg-config');
   const sourceRoot = join(sandbox.context.projectRoot, '.claude', 'skills');
   const source = await putSkill(sourceRoot, 'xdg-private', 'Private user placement');
   await rm(sandbox.context.configHome, { recursive: true, force: true });
@@ -458,6 +463,7 @@ it('applies OpenCode user skills and private preferences under absent XDG roots 
   expect(plan.findings.some(finding => finding.severity === 'error')).toBe(false);
   expect(plan.operations.some(operation => operation.kind === 'mkdir' && operation.path.startsWith(sandbox!.context.stateHome))).toBe(false);
   const privateDirs = [
+    ...configParents,
     sandbox.context.configHome,
     join(sandbox.context.configHome, 'mishmash'),
     join(sandbox.context.configHome, 'mishmash', 'projects'),
@@ -475,6 +481,36 @@ it('applies OpenCode user skills and private preferences under absent XDG roots 
   expect((await snapshotPath(target)).kind).toBe('directory');
   expect((await snapshotPath(paths.preferencePath)).kind).toBe('file');
   expect((await snapshotPath(paths.ownershipPath)).kind).toBe('file');
+});
+
+it('applies OpenCode output and metadata through a symlinked XDG config root', async () => {
+  sandbox = await createSandbox();
+  const source = await putSkill(join(sandbox.context.projectRoot, '.claude', 'skills'), 'config-alias', 'Alias-safe user skill');
+  const physicalConfig = join(sandbox.root, 'physical-config');
+  await mkdir(physicalConfig, { recursive: true });
+  await rm(sandbox.context.configHome, { recursive: true, force: true });
+  sandbox.context.configHome = join(sandbox.root, 'config-alias');
+  await symlink(physicalConfig, sandbox.context.configHome);
+  const inventory = await inventoryFor();
+  const selected = skill(inventory, 'config-alias', source);
+  const loaded = await readState(sandbox.context, 'private-project');
+  const paths = await getStatePaths(sandbox.context, 'private-project');
+  const plan = await planSync(sandbox.context, inventory,
+    request([selected.id], [{ agentId: 'opencode', placement: 'user' }]), loaded);
+  expect(plan.findings.some(finding => finding.severity === 'error')).toBe(false);
+  const physicalPreference = join(physicalConfig, 'mishmash', 'projects', basename(paths.preferencePath));
+  const physicalOwnership = join(sandbox.context.stateHome, 'mishmash', 'ownership.json');
+  expect(plan.operations.some(operation => operation.kind === 'write' && operation.path === physicalPreference)).toBe(true);
+  expect(plan.operations.some(operation => operation.kind === 'write' && operation.path === physicalOwnership)).toBe(true);
+  expect(plan.preconditions.some(snapshot => snapshot.path === sandbox!.context.configHome && snapshot.kind === 'symlink')).toBe(true);
+  expect(plan.preconditions.some(snapshot => snapshot.path === join(sandbox!.context.configHome, 'mishmash', 'projects', basename(paths.preferencePath)))).toBe(false);
+  expect(plan.preconditions.some(snapshot => snapshot.path === physicalPreference)).toBe(true);
+  const result = await applyPlan(plan, { confirmed: true });
+  expect(result.status).toBe('applied');
+  expect((await snapshotPath(join(sandbox.context.configHome, 'opencode', 'skills', 'config-alias'))).kind).toBe('directory');
+  expect((await snapshotPath(paths.preferencePath)).kind).toBe('file');
+  expect((await snapshotPath(paths.ownershipPath)).kind).toBe('file');
+  expect((await readState(sandbox.context, 'private-project')).findings).toEqual([]);
 });
 
 it('applies a canonical MCP edit through a safe aliased native configuration directory', async () => {
@@ -501,6 +537,46 @@ it('applies a canonical MCP edit through a safe aliased native configuration dir
     mcpServers: Record<string, { command: string }>;
   };
   expect(output.mcpServers.canonical?.command).toBe('do-not-run');
+});
+
+it('retargets an owned link before removing its old referent during apply', async () => {
+  sandbox = await createSandbox();
+  const source = await putSkill(join(sandbox.context.projectRoot, '.claude', 'skills'), 'link-update', 'Linked asset update');
+  await putFile(join(source, 'old.txt'), 'obsolete referent');
+  const target = join(sandbox.context.homeDir, '.agents', 'skills', 'link-update');
+  await mkdir(dirname(target), { recursive: true });
+  await cp(source, target, { recursive: true });
+  const previous = await snapshotPath(target);
+  await rm(join(source, 'old.txt'));
+  await putFile(join(source, 'new.txt'), 'new referent');
+  await symlink('new.txt', join(source, 'link'));
+  const inventory = await inventoryFor();
+  const selected = skill(inventory, 'link-update', source);
+  const paths = await getStatePaths(sandbox.context, 'private-project');
+  const authority: AuthorityConfig = { version: 1, sources: [selected.source], resourceAuthorities: { 'skill:link-update': selected.id } };
+  const ownership: OwnershipState = { version: 1, receipts: [{
+    slotId: fingerprintValue([resolve(target), 'skill']), path: resolve(target), kind: 'skill', key: 'link-update',
+    sourceId: selected.source.id, resourceId: selected.id, fingerprint: previous.digest,
+  }] };
+  await mkdir(dirname(paths.preferencePath), { recursive: true });
+  await mkdir(dirname(paths.ownershipPath), { recursive: true });
+  await writeFile(paths.preferencePath, encodeAuthorityConfig(authority), { mode: 0o600 });
+  await writeFile(paths.ownershipPath, encodeOwnershipState(ownership), { mode: 0o600 });
+  const plan = await planSync(sandbox.context, inventory,
+    request([selected.id], [{ agentId: 'codex', placement: 'user' }], {
+      authority: { version: 1, sources: [selected.source], resourceAuthorities: { 'skill:link-update': selected.id } },
+    }), await loadState());
+  expect(plan.findings.some(finding => finding.severity === 'error')).toBe(false);
+  const operations = resources(plan.operations);
+  const newFile = operations.findIndex(operation => operation.kind === 'write' && operation.path === join(target, 'new.txt'));
+  const link = operations.findIndex(operation => operation.kind === 'symlink' && operation.path === join(target, 'link'));
+  const obsolete = operations.findIndex(operation => operation.kind === 'remove' && operation.path === join(target, 'old.txt'));
+  expect(newFile).toBeGreaterThanOrEqual(0);
+  expect(link).toBeGreaterThan(newFile);
+  expect(obsolete).toBeGreaterThan(link);
+  expect((await applyPlan(plan, { confirmed: true })).status).toBe('applied');
+  expect((await snapshotPath(join(target, 'old.txt'))).kind).toBe('missing');
+  expect(await readFile(join(target, 'link'), 'utf8')).toBe('new referent');
 });
 
 it('removes obsolete assets only inside the selected owned skill and keeps unrelated destination skills', async () => {
