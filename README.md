@@ -1,5 +1,7 @@
 # mishmash
 
+<img width="1254" height="1254" alt="image" src="https://github.com/user-attachments/assets/5fd46c1c-1e61-41ca-a1e0-fd6e0c963807" />
+
 One reviewed set of **skills and MCP server definitions**, projected into multiple coding-agent harnesses without treating their configuration formats as interchangeable.
 
 mishmash is a TypeScript/Node.js CLI and library for adopting existing native resources into `.agents`, reviewing a migration plan, and synchronizing selected targets. Initial adapter IDs:
