@@ -1,8 +1,9 @@
 import { afterEach, expect, it } from 'vitest';
-import { cp, mkdir, rm, symlink, writeFile } from 'node:fs/promises';
+import { cp, mkdir, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import type { AgentId, AuthorityConfig, DestinationRequest, OwnershipState, ResourceInstance, SyncRequest } from '../../src/model.js';
 import { discover } from '../../src/core/discover.js';
+import { applyPlan } from '../../src/fs/apply.js';
 import { planSync } from '../../src/core/plan.js';
 import { fingerprintValue, snapshotMatches, snapshotPath } from '../../src/fs/snapshot.js';
 import { decodeAuthorityConfig, decodeOwnershipState, encodeAuthorityConfig, encodeOwnershipState, getStatePaths, readState } from '../../src/state.js';
@@ -391,8 +392,70 @@ it('plans private metadata beneath absent approved XDG roots without creating th
   expect(plan.operations.some(operation => operation.purpose === 'state' && operation.kind === 'write' && operation.path === paths.preferencePath)).toBe(true);
   expect(plan.operations.some(operation => operation.purpose === 'state' && operation.kind === 'write' && operation.path === paths.ownershipPath)).toBe(true);
   expect(plan.operations.some(operation => operation.purpose === 'state' && operation.kind === 'mkdir' && operation.path === sandbox!.context.configHome)).toBe(true);
-  expect(plan.operations.some(operation => operation.purpose === 'state' && operation.kind === 'mkdir' && operation.path === sandbox!.context.stateHome)).toBe(true);
+  expect(plan.operations.some(operation => operation.purpose === 'state' && operation.kind === 'mkdir' && operation.path.startsWith(sandbox!.context.stateHome))).toBe(false);
+  const privateConfigDirs = plan.operations.filter(operation => operation.purpose === 'state' && operation.kind === 'mkdir' && operation.path.startsWith(sandbox!.context.configHome));
+  expect(privateConfigDirs.length).toBeGreaterThan(0);
+  expect(privateConfigDirs.every(operation => operation.kind === 'mkdir' && operation.mode === 0o700)).toBe(true);
   expect(await snapshotMatches(before)).toBe(true);
+});
+
+it('applies skill copies through safe parent symlinks and bootstraps absent XDG roots privately', async () => {
+  sandbox = await createSandbox();
+  const sourceRoot = join(sandbox.context.projectRoot, '.claude', 'skills');
+  const source = await putSkill(sourceRoot, 'applied-through-alias', 'Safe alias destination');
+  const physicalOutput = join(sandbox.context.projectRoot, 'physical-output');
+  await mkdir(join(physicalOutput, 'skills'), { recursive: true });
+  await symlink(physicalOutput, join(sandbox.context.projectRoot, '.agents'));
+  await rm(sandbox.context.configHome, { recursive: true, force: true });
+  await rm(sandbox.context.stateHome, { recursive: true, force: true });
+  const inventory = await inventoryFor();
+  const selected = skill(inventory, 'applied-through-alias', source);
+  const loadedState = await readState(sandbox.context, 'private-project');
+  const paths = await getStatePaths(sandbox.context, 'private-project');
+  const plan = await planSync(sandbox.context, inventory,
+    request([selected.id], [{ agentId: 'codex', placement: 'project' }]), loadedState);
+  expect(plan.findings.some(finding => finding.severity === 'error')).toBe(false);
+  expect(plan.operations.some(operation => operation.purpose === 'state' && operation.kind === 'mkdir'
+    && operation.path.startsWith(sandbox!.context.stateHome))).toBe(false);
+  expect(plan.operations.filter(operation => operation.kind === 'mkdir' && operation.path.startsWith(sandbox!.context.configHome))
+    .every(operation => operation.kind === 'mkdir' && operation.mode === 0o700)).toBe(true);
+  const result = await applyPlan(plan, { confirmed: true });
+  expect(result.status).toBe('applied');
+  const target = join(physicalOutput, 'skills', 'applied-through-alias');
+  expect((await snapshotPath(target)).kind).toBe('directory');
+  expect((await readFile(join(target, 'SKILL.md'), 'utf8')).includes('Safe alias destination')).toBe(true);
+  expect((await stat(sandbox.context.configHome)).mode & 0o777).toBe(0o700);
+  expect((await stat(join(sandbox.context.configHome, 'mishmash'))).mode & 0o777).toBe(0o700);
+  expect((await stat(sandbox.context.stateHome)).mode & 0o777).toBe(0o700);
+  expect((await stat(join(sandbox.context.stateHome, 'mishmash'))).mode & 0o777).toBe(0o700);
+  expect((await snapshotPath(paths.preferencePath)).kind).toBe('file');
+  expect((await snapshotPath(paths.ownershipPath)).kind).toBe('file');
+});
+
+it('applies a canonical MCP edit through a safe aliased native configuration directory', async () => {
+  sandbox = await createSandbox();
+  const sourcePath = join(sandbox.context.projectRoot, '.mcp.json');
+  await putFile(sourcePath, JSON.stringify({ mcpServers: { canonical: { type: 'stdio', command: 'do-not-run' } } }));
+  const physicalGemini = join(sandbox.context.projectRoot, 'physical-gemini');
+  await mkdir(physicalGemini, { recursive: true });
+  await symlink(physicalGemini, join(sandbox.context.projectRoot, '.gemini'));
+  const inventory = await inventoryFor();
+  const selected = mcp(inventory, 'canonical', 'claude-code');
+  const state = await readState(sandbox.context, 'private-project');
+  const plan = await planSync(sandbox.context, inventory,
+    request([selected.id], [{ agentId: 'gemini-cli', placement: 'project' }]), state);
+  expect(plan.findings.some(finding => finding.severity === 'error')).toBe(false);
+  const configPath = join(physicalGemini, 'settings.json');
+  expect(plan.operations.some(operation => operation.kind === 'write' && operation.path === configPath)).toBe(true);
+  expect(plan.preconditions.some(snapshot => snapshot.path === join(sandbox!.context.projectRoot, '.gemini', 'settings.json'))).toBe(false);
+  expect(plan.preconditions.some(snapshot => snapshot.path === configPath)).toBe(true);
+  expect(plan.preconditions.some(snapshot => snapshot.path === join(sandbox!.context.projectRoot, '.gemini') && snapshot.kind === 'symlink')).toBe(true);
+  const result = await applyPlan(plan, { confirmed: true });
+  expect(result.status).toBe('applied');
+  const output = JSON.parse(await readFile(join(sandbox.context.projectRoot, '.gemini', 'settings.json'), 'utf8')) as {
+    mcpServers: Record<string, { command: string }>;
+  };
+  expect(output.mcpServers.canonical?.command).toBe('do-not-run');
 });
 
 it('removes obsolete assets only inside the selected owned skill and keeps unrelated destination skills', async () => {

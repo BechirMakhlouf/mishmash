@@ -92,6 +92,28 @@ async function inspectScopedPath(path: string, roots: readonly string[], allowFi
     return { snapshot, safe: safeParent && safeTarget && validParents };
   } catch { return { safe: false }; }
 }
+async function addPhysicalPrecondition(builder: PlanBuilder, snapshot: PathSnapshot, canonical?: PathSnapshot): Promise<void> {
+  if (snapshot.kind === 'symlink' || resolve(snapshot.path) === resolve(snapshot.resolvedPath)) {
+    builder.addPrecondition(snapshot);
+    return;
+  }
+  for (const parent of snapshot.parents) {
+    if (parent.kind !== 'symlink') continue;
+    const alias = await snapshotPath(parent.path);
+    if (alias.kind !== 'symlink' || alias.linkTarget !== parent.linkTarget) {
+      builder.findings.push(issue('DESTINATION_CHANGED', 'A destination symlink changed while its physical location was being reviewed.', parent.path));
+      return;
+    }
+    builder.addPrecondition(alias);
+  }
+  const physical = canonical ?? await snapshotPath(snapshot.resolvedPath);
+  if (physical.kind !== snapshot.kind || physical.digest !== snapshot.digest || physical.mode !== snapshot.mode
+    || resolve(physical.resolvedPath) !== resolve(snapshot.resolvedPath)) {
+    builder.findings.push(issue('DESTINATION_CHANGED', 'A destination changed while its physical location was being reviewed.', snapshot.path));
+    return;
+  }
+  builder.addPrecondition(physical);
+}
 
 function skillSlot(path: string): string { return fingerprintValue([resolve(path), 'skill']); }
 function skillFingerprint(snapshot: PathSnapshot): string {
@@ -176,7 +198,7 @@ function orderOperations(operations: readonly Operation[]): Operation[] {
   });
 }
 
-async function addDirsForDestination(builder: PlanBuilder, directory: string, boundary: string, expectedByPath: Map<string, PathSnapshot>, resourceIds: readonly string[], purpose: 'resource' | 'state' = 'resource'): Promise<void> {
+async function addDirsForDestination(builder: PlanBuilder, directory: string, boundary: string, expectedByPath: Map<string, PathSnapshot>, resourceIds: readonly string[], purpose: 'resource' | 'state' = 'resource', directoryMode = 0o755): Promise<void> {
   const missing: { path: string; snapshot: PathSnapshot }[] = [];
   let current = resolve(directory);
   const root = resolve(boundary);
@@ -192,7 +214,7 @@ async function addDirsForDestination(builder: PlanBuilder, directory: string, bo
     current = parent;
   }
   for (const { path, snapshot } of missing.reverse()) {
-    builder.addOperation({ kind: 'mkdir', path, expected: snapshot, mode: 0o755,
+    builder.addOperation({ kind: 'mkdir', path, expected: snapshot, mode: directoryMode,
       resourceIds, purpose, description: 'Create a destination directory.' });
   }
 }
@@ -517,6 +539,13 @@ async function prepareMcpDestination(
       continue;
     }
     const physicalPath = await physicalEntryPath(first.path, file.snapshot);
+    const canonicalFile = await snapshotPath(physicalPath);
+    if (canonicalFile.kind !== file.snapshot.kind || canonicalFile.digest !== file.snapshot.digest
+      || canonicalFile.mode !== file.snapshot.mode || resolve(canonicalFile.resolvedPath) !== physicalPath) {
+      builder.findings.push(issue('DESTINATION_CHANGED', 'An MCP configuration changed while its physical location was being reviewed.', first.path));
+      continue;
+    }
+    await addPhysicalPrecondition(builder, file.snapshot, canonicalFile);
     let aliasesMatch = true;
     for (const target of targets.slice(1)) {
       const alias = await inspectScopedPath(target.path, roots);
@@ -526,13 +555,12 @@ async function prepareMcpDestination(
         aliasesMatch = false;
         break;
       }
-      builder.addPrecondition(alias.snapshot);
+      await addPhysicalPrecondition(builder, alias.snapshot, canonicalFile);
     }
     if (!aliasesMatch) {
       builder.findings.push(issue('MCP_DESTINATION_SLOT_CONFLICT', 'The same physical MCP slot has inconsistent native file snapshots.', first.path));
       continue;
     }
-    builder.addPrecondition(file.snapshot);
     targetPhysicalPaths.set(slotId, physicalPath);
     const receipt = receipts.get(slotId);
     if (receipt && (receipt.kind !== 'mcp' || resolve(receipt.path) !== physicalPath || receipt.key !== first.key)) {
@@ -589,9 +617,8 @@ async function prepareMcpDestination(
       blockedPaths.add(path);
       continue;
     }
-    builder.addPrecondition(alias.snapshot);
-    builder.addPrecondition(edit.expected);
-    builder.addPrecondition(expected);
+    await addPhysicalPrecondition(builder, alias.snapshot, expected);
+    await addPhysicalPrecondition(builder, edit.expected, expected);
     if (!associated.length) {
       builder.findings.push(issue('UNSCOPED_MCP_EDIT', 'A native adapter prepared a file edit without a selected registration target.', aliasPath));
       blockedPaths.add(path);
@@ -734,7 +761,7 @@ export async function planSync(
           if (!directory.safe || !directory.snapshot || directory.snapshot.kind !== 'missing' && directory.snapshot.kind !== 'directory') {
             builder.findings.push(issue('UNSAFE_DESTINATION_PATH', 'A skill destination root is unsafe or is not a directory.', location.path));
           } else {
-            builder.addPrecondition(directory.snapshot);
+            await addPhysicalPrecondition(builder, directory.snapshot);
             for (const resource of selectedSkills) {
               await skillPlan(builder, resource, destination, adapter, skillMode, directory.snapshot.resolvedPath,
                 location.scope, location.visibility, allowedRoots, receiptLookup, nextReceipts);
@@ -801,14 +828,14 @@ export async function planSync(
         builder.addPrecondition(preferenceParentSafe.snapshot);
         const root = preferencesRoot.find(candidate => isWithin(candidate, preferenceParent)) ?? projectRoot;
         const expectedByPath = new Map([[preferenceParent, preferenceParentSafe.snapshot], [expectedPreference, preferenceSnapshot]]);
-        await addDirsForDestination(builder, preferenceParent, root, expectedByPath, [], 'state');
+        await addDirsForDestination(builder, preferenceParent, root, expectedByPath, [], 'state',
+          approvedRequest.configuration === 'project' ? 0o755 : 0o700);
         builder.addOperation({ kind: 'write', path: expectedPreference, expected: preferenceSnapshot,
           content: { kind: 'bytes', bytes: preferenceBytes }, mode: 0o600, resourceIds: [], purpose: 'state', description: 'Record approved authority preferences.' });
       }
       if (ownershipDifferent && ownershipSnapshot && ownershipParentSafe.safe && ownershipParentSafe.snapshot) {
         builder.addPrecondition(ownershipParentSafe.snapshot);
         const expectedByPath = new Map([[ownershipParent, ownershipParentSafe.snapshot], [expectedOwnership, ownershipSnapshot]]);
-        await addDirsForDestination(builder, ownershipParent, stateRoots.find(candidate => isWithin(candidate, ownershipParent)) ?? stateRoot, expectedByPath, [], 'state');
         builder.addOperation({ kind: 'write', path: expectedOwnership, expected: ownershipSnapshot,
           content: { kind: 'bytes', bytes: ownershipBytes }, mode: 0o600, resourceIds: [], purpose: 'state', description: 'Record synchronization ownership receipts.' });
       }
