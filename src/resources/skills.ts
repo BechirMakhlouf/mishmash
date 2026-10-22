@@ -2,7 +2,7 @@ import { lstat, readFile, readdir, realpath } from 'node:fs/promises';
 import { basename, isAbsolute, join, resolve } from 'node:path';
 import { parseDocument } from 'yaml';
 import type { AgentId, Finding, Scope, SkillResource, SourceRef, Visibility } from '../model.js';
-import { errorCode, filesystemFinding, isWithin, snapshotPath } from '../fs/snapshot.js';
+import { errorCode, filesystemFinding, isWithin, snapshotMatches, snapshotPath } from '../fs/snapshot.js';
 
 export function sourceRef(agentId: AgentId | 'shared', path: string, scope: Scope, visibility: Visibility, label: string): SourceRef {
   const absolute = resolve(path);
@@ -13,6 +13,7 @@ export interface SkillReadResult { resources: readonly SkillResource[]; findings
 export async function readSkillDirectory(path: string, source: SourceRef, locator = basename(path)): Promise<SkillReadResult> {
   try {
     const actual = await realpath(path);
+    const snapshot = await snapshotPath(actual);
     const metadataPath = join(actual, 'SKILL.md');
     const text = await readFile(metadataPath, 'utf8');
     let name = basename(path);
@@ -31,7 +32,6 @@ export async function readSkillDirectory(path: string, source: SourceRef, locato
       if (typeof fields.name === 'string') name = fields.name.trim();
       if (typeof fields.description === 'string') description = fields.description.trim();
     }
-    const snapshot = await snapshotPath(actual);
     for (const entry of snapshot.entries) {
       if (entry.kind === 'other') return { resources: [], findings: [filesystemFinding(path, 'UNSUPPORTED_SKILL_ENTRY')] };
       if (entry.kind === 'symlink') {
@@ -40,6 +40,7 @@ export async function readSkillDirectory(path: string, source: SourceRef, locato
         if (!isWithin(actual, referent)) return { resources: [], findings: [filesystemFinding(path, 'UNSAFE_SKILL_LINK')] };
       }
     }
+    if (!await snapshotMatches(snapshot)) return { resources: [], findings: [filesystemFinding(path, 'SOURCE_CHANGED')] };
     return { resources: [{ kind: 'skill', id: resourceId(source, locator), name, ...(description ? { description } : {}), source, path: actual, locator, snapshot }], findings: [] };
   } catch { return { resources: [], findings: [filesystemFinding(path)] }; }
 }
