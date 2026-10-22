@@ -296,7 +296,7 @@ export const opencodeAdapter: NativeAdapter = {
       for (const { resource, native, nativePath, existing } of staged) {
         const before = existing ? fingerprintValue(existing.native) : undefined;
         const after = fingerprintValue(native);
-        targets.push({ resourceId: resource.id, key: resource.name, path: document.snapshot.resolvedPath, slotId: fingerprintValue([document.snapshot.resolvedPath, 'mcp', JSON.stringify(nativePath)]), ...(before === undefined ? {} : { beforeFingerprint: before }), afterFingerprint: after });
+        targets.push({ resourceId: resource.id, key: resource.name, path, slotId: fingerprintValue([document.snapshot.resolvedPath, 'mcp', JSON.stringify(nativePath)]), ...(before === undefined ? {} : { beforeFingerprint: before }), afterFingerprint: after });
         if (before !== after) changes.push({ path: nativePath, value: native });
       }
       return { files: changes.length ? [{ path, bytes: editJsonDocument(document.text, changes), mode: document.snapshot.kind === 'missing' ? 0o600 : document.snapshot.mode, expected: document.snapshot }] : [], targets, findings };

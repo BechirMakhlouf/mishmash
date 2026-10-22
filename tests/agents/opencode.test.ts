@@ -266,6 +266,8 @@ describe('OpenCode native adapter', () => {
     const prepared = await opencodeAdapter.prepareMcpEdit(sandbox.context, 'project', [selected]);
     expect(prepared.targets[0]?.slotId).toBe(fingerprintValue([join(one, 'opencode.json'), 'mcp', JSON.stringify(['mcp', 'selected'])]));
     expect(prepared.files).toHaveLength(0);
+    expect(prepared.targets[0]?.path).toBe(join(alias, 'opencode.json'));
+    expect(prepared.targets[0]?.beforeFingerprint).toBe(prepared.targets[0]?.afterFingerprint);
     await unlink(alias);
     await symlink(two, alias);
     const second = (await opencodeAdapter.discover(sandbox.context)).resources.find(resource => resource.kind === 'skill')!;
