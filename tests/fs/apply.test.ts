@@ -229,17 +229,22 @@ describe('applyPlan', () => {
     expect((await applyPlan(plan(context, [await write(target, 'same bytes', 'resource', 0o640)]), { confirmed: true })).status).toBe('unchanged');
     expect(snapshotsEqual(before, await snapshotPath(root))).toBe(true);
     expect((await stat(target, { bigint: true })).mtimeNs).toBe(originalTime);
-    const applied = await applyPlan(plan(context, [await write(target, 'new bytes')]), { confirmed: true });
+    const statePaths = await getStatePaths(context);
+    const stateBytes = encodeOwnershipState({ version: 1, receipts: [] });
+    const applied = await applyPlan(plan(context, [await write(target, 'new bytes'), await write(statePaths.ownershipPath, stateBytes, 'state', 0o600)]), { confirmed: true });
     expect(applied.status).toBe('applied');
     const paths = await getStatePaths(context);
     const transactions = await readdir(paths.transactionRoot);
     const after = await snapshotPath(root);
     const outputStat = await stat(target, { bigint: true });
     const journalStat = await stat(join(applied.transactionPath!, 'journal.json'), { bigint: true });
+    const stateStat = await stat(paths.ownershipPath, { bigint: true });
     expect((await applyPlan(plan(context, []), { confirmed: true })).status).toBe('unchanged');
     expect(snapshotsEqual(after, await snapshotPath(root))).toBe(true);
     expect((await stat(target, { bigint: true })).mtimeNs).toBe(outputStat.mtimeNs);
     expect((await stat(join(applied.transactionPath!, 'journal.json'), { bigint: true })).mtimeNs).toBe(journalStat.mtimeNs);
+    expect((await stat(paths.ownershipPath, { bigint: true })).mtimeNs).toBe(stateStat.mtimeNs);
+    expect(await bytesEqual(paths.ownershipPath, stateBytes)).toBe(true);
     expect(await readdir(paths.transactionRoot)).toEqual(transactions);
   });
 

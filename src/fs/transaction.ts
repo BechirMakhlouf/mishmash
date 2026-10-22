@@ -53,7 +53,7 @@ export async function acquireLock(lockPath: string, reclaim = false, journal?: T
     if (reviewed.kind !== 'file') throw new TransactionError('UNSAFE_LOCK', lockPath);
     let owner: unknown;
     try { owner = JSON.parse(await readFile(lockPath, 'utf8')) as unknown; } catch { throw new TransactionError('UNSAFE_LOCK', lockPath); }
-    if (typeof owner !== 'object' || owner === null || !('pid' in owner) || !Number.isSafeInteger(owner.pid) || Number(owner.pid) <= 0) throw new TransactionError('UNSAFE_LOCK', lockPath);
+    if (typeof owner !== 'object' || owner === null || !('pid' in owner) || !Number.isSafeInteger(owner.pid) || Number(owner.pid) <= 0 || !('token' in owner) || typeof owner.token !== 'string' || owner.token.length === 0) throw new TransactionError('UNSAFE_LOCK', lockPath);
     try { process.kill(Number(owner.pid), 0); throw new TransactionError('APPLY_LOCKED', lockPath); }
     catch (ownerError) { if (errorCode(ownerError) !== 'ESRCH') throw ownerError; }
     if (!await snapshotMatches(reviewed)) throw new TransactionError('APPLY_LOCKED', lockPath);
@@ -135,7 +135,7 @@ export async function scanRecovery(context: Context): Promise<{ transactions: { 
     if (lock.kind !== 'missing') {
       if (lock.kind !== 'file' || lock.mode !== 0o600) throw new TransactionError('UNSAFE_LOCK', lockPath);
       const owner: unknown = JSON.parse(await readFile(lockPath, 'utf8'));
-      if (typeof owner !== 'object' || owner === null || !('pid' in owner) || !Number.isSafeInteger(owner.pid) || Number(owner.pid) <= 0 || !('journal' in owner)) throw new TransactionError('UNSAFE_LOCK', lockPath);
+      if (typeof owner !== 'object' || owner === null || !('pid' in owner) || !Number.isSafeInteger(owner.pid) || Number(owner.pid) <= 0 || !('token' in owner) || typeof owner.token !== 'string' || owner.token.length === 0 || !('journal' in owner)) throw new TransactionError('UNSAFE_LOCK', lockPath);
       let dead = false;
       try { process.kill(Number(owner.pid), 0); } catch (error) { if (errorCode(error) === 'ESRCH') dead = true; else throw error; }
       if (dead) {
