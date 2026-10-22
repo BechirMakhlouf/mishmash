@@ -20,7 +20,7 @@ function hasSubstitution(value: unknown): boolean {
 function definition(value: unknown): McpDefinition | undefined {
   if (!isRecord(value)) return undefined;
   const type = value.type ?? 'local';
-  if (type !== 'local' && type !== 'stdio' && type !== 'http' && type !== 'sse') return undefined;
+  if (type !== 'local' && type !== 'stdio' && type !== 'http' && type !== 'streamable-http' && type !== 'sse') return undefined;
   const stdio = type === 'local' || type === 'stdio';
   if (stdio ? typeof value.command !== 'string' || !value.command.trim() : typeof value.url !== 'string' || !value.url.trim()) return undefined;
   if (value.args !== undefined && !strings(value.args) || value.env !== undefined && !stringMap(value.env)
@@ -30,7 +30,7 @@ function definition(value: unknown): McpDefinition | undefined {
   const unsupportedFields = Object.keys(value).filter(key => !commonFields.has(key) && !(key === 'tools' && strings(value.tools) && value.tools.length === 1 && value.tools[0] === '*'));
   if (hasSubstitution(Object.fromEntries(Object.entries(value).filter(([key]) => commonFields.has(key) && key !== 'type')))) unsupportedFields.push('variable-substitution');
   return {
-    transport: type === 'local' ? 'stdio' : type, nativeAgent: id, native: value,
+    transport: type === 'local' ? 'stdio' : type === 'streamable-http' ? 'http' : type, nativeAgent: id, native: value,
     ...(stdio ? { command: value.command as string } : { url: value.url as string }),
     ...(value.args === undefined ? {} : { args: value.args as string[] }),
     ...(value.env === undefined ? {} : { env: value.env as Record<string, string> }),

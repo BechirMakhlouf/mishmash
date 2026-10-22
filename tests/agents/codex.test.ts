@@ -122,6 +122,32 @@ describe('Codex native adapter', () => {
     expect(await readFile(path, 'utf8')).toBe(text);
   });
 
+  it.each([
+    { name: 'selected', header: '[mcp_servers.selected ]' },
+    { name: 'selected', header: '[ "mcp_servers" . "selected" \t]' },
+    { name: 'selected', header: "[ mcp_servers . 'selected' \t]" },
+    { name: 'selected]name', header: '[mcp_servers."selected]name" \t]' },
+  ])('replaces whitespace-padded header $header without consuming neighboring native content', async ({ name, header }) => {
+    const box = await sandbox();
+    const source = await codexSource(box, `[mcp_servers.${JSON.stringify(name)}]\ncommand = "new-command"\n`);
+    const path = join(box.context.projectRoot, '.codex', 'config.toml');
+    const neighboring = '# neighboring comment\n[mcp_servers.unchecked ] # unchecked header\ncommand = \'keep exact\'\n\n[settings ] # settings header\ncolor = "native"\n';
+    const text = `model = "stay" # model comment\n${header} # selected header comment\ncommand = "old"\n[[mcp_servers.${JSON.stringify(name)}.metadata \t]] # selected array comment\nname = "old metadata"\n\n${neighboring}`;
+    await putFile(path, text);
+    const before = await snapshotPath(box.root);
+    const result = await codexAdapter.prepareMcpEdit(box.context, 'project', [source]);
+    expect(result.findings).toEqual([]);
+    expect(result.files).toHaveLength(1);
+    const edited = Buffer.from(result.files[0]!.bytes).toString();
+    const servers = parse(edited).mcp_servers as Record<string, unknown>;
+    expect(fingerprintValue(servers[name])).toBe(fingerprintValue(source.definition.native));
+    expect(edited.startsWith('model = "stay" # model comment\n')).toBe(true);
+    expect(edited.includes(neighboring)).toBe(true);
+    expect(edited.includes('# selected header comment')).toBe(true);
+    expect(edited.includes('# selected array comment')).toBe(true);
+    expect(snapshotsEqual(before, await snapshotPath(box.root))).toBe(true);
+  });
+
   it('coalesces additions, quoted keys, and updates without whole-document normalization', async () => {
     const box = await sandbox();
     await codexSource(box, '[mcp_servers."quoted.name"]\ncommand = "one"\n[mcp_servers.second]\nurl = "https://example.invalid/mcp"\n');

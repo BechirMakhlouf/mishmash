@@ -122,6 +122,40 @@ describe('GitHub Copilot CLI native adapter', () => {
     expect(file.expected.digest).toBe((await snapshotPath(path)).digest);
   });
 
+  it.each(['wrapped', 'bare'] as const)('normalizes streamable-http discovery and preserves native alias entries in %s subset edits', async format => {
+    const box = await sandbox();
+    const native = { type: 'streamable-http', url: 'https://selected.invalid/mcp', headers: { Accept: 'application/json' }, tools: ['read'], timeout: 1500 };
+    const source = await copilotSource(box, native);
+    expect(source.definition.transport).toBe('http');
+    expect(fingerprintValue(source.definition.native)).toBe(fingerprintValue(native));
+    const path = join(box.context.projectRoot, '.github', 'mcp.json');
+    const unchecked = { type: 'streamable-http', url: 'https://unchecked.invalid/mcp', tools: ['read'] };
+    const untouched = `"unchecked": ${JSON.stringify(unchecked)}`;
+    const entries = `"selected": {"type":"http","url":"https://old.invalid/mcp"}, ${untouched}`;
+    const text = format === 'wrapped' ? `{ "setting":"keep", "mcpServers": { ${entries} } }\n` : `{ ${entries} }\n`;
+    await putFile(path, text);
+    const before = await snapshotPath(box.root);
+    const discovered = await githubCopilotCliAdapter.discover(box.context);
+    expect(discovered.findings).toEqual([]);
+    const discoveredUnchecked = discovered.resources.find(resource => resource.kind === 'mcp' && resource.name === 'unchecked');
+    if (!discoveredUnchecked || discoveredUnchecked.kind !== 'mcp') throw new Error('Expected native alias registration');
+    expect(discoveredUnchecked.definition.transport).toBe('http');
+    expect(discoveredUnchecked.definition.native.type).toBe('streamable-http');
+    const result = await githubCopilotCliAdapter.prepareMcpEdit(box.context, 'project', [source]);
+    expect(result.findings).toEqual([]);
+    expect(result.files).toHaveLength(1);
+    const edited = Buffer.from(result.files[0]!.bytes).toString();
+    const parsed = JSON.parse(edited) as Record<string, unknown>;
+    const map = (format === 'wrapped' ? parsed.mcpServers : parsed) as Record<string, unknown>;
+    expect(fingerprintValue(map.selected)).toBe(fingerprintValue(native));
+    expect(fingerprintValue(map.unchecked)).toBe(fingerprintValue(unchecked));
+    expect(edited.includes(untouched)).toBe(true);
+    if (format === 'wrapped') expect(parsed.setting).toBe('keep');
+    expect(result.targets).toHaveLength(1);
+    expect(result.targets[0]?.afterFingerprint).toBe(fingerprintValue(native));
+    expect(snapshotsEqual(before, await snapshotPath(box.root))).toBe(true);
+  });
+
   it('returns unchanged ownership evidence without touching bytes or mtime', async () => {
     const box = await sandbox();
     const source = await copilotSource(box, { type: 'local', command: 'unchanged', tools: ['read'], timeout: 1000 });

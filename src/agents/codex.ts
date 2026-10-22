@@ -167,7 +167,10 @@ function editRegistration(document: TomlDocument, name: string, native: Record<s
     }
     if (startsWith(entry.resolvedKey, target)) {
       // Header only: comments and whitespace outside selected expressions survive.
-      edits.push({ start: entry.range[0], end: entry.key.range[1] + (entry.kind === 'array' ? 2 : 1), text: '' });
+      const delimiter = entry.kind === 'array' ? ']]' : ']';
+      const closing = document.text.indexOf(delimiter, entry.key.range[1]);
+      if (closing < 0) throw new Error('Missing table delimiter');
+      edits.push({ start: entry.range[0], end: closing + delimiter.length, text: '' });
     }
     for (const item of entry.body) {
       if (startsWith([...entry.resolvedKey, ...keys(item.key)], target)) edits.push({ start: item.range[0], end: item.range[1], text: '' });

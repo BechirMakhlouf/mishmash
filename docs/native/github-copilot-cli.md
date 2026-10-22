@@ -5,6 +5,7 @@ Primary references, consulted 2026-10-22:
 - [GitHub: adding CLI agent skills](https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/add-skills).
 - [GitHub: adding CLI MCP servers](https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/add-mcp-servers).
 - [GitHub: CLI configuration directory](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-config-dir-reference).
+- [GitHub: CLI native transport types](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-command-reference#transport-types), including the `streamable-http` alias.
 - [GitHub: MCP JSON fields](https://docs.github.com/en/copilot/how-tos/copilot-on-github/customize-copilot/configure-mcp-servers#writing-a-json-configuration-for-mcp-servers), linked by the CLI MCP documentation; cloud-agent trust behavior is not used as CLI behavior.
 
 ## Locations and scope
@@ -24,7 +25,7 @@ GitHub describes `.mcp.json` as local/per-checkout but does not guarantee it is 
 
 ## MCP formats and portability
 
-User config uses a top-level `mcpServers` object. Current project configs accept either that wrapper or a bare server-name map. Existing project format is retained on selected edits; newly created files use `mcpServers`. Native `type` values `local` and `stdio` both mean stdio, while `http` means Streamable HTTP and `sse` means legacy SSE. Omitting type uses the local form, as allowed by native project examples. VS Code's `.vscode/mcp.json`/`servers` schema is not an alias and is not discovered.
+User config uses a top-level `mcpServers` object. Current project configs accept either that wrapper or a bare server-name map. Existing project format is retained on selected edits; newly created files use `mcpServers`. Native `type` values `local` and `stdio` both mean stdio, while `http` and its documented `streamable-http` alias normalize to common HTTP transport; `sse` means legacy SSE. The complete original native entry, including `streamable-http` spelling, is retained for same-agent copies; unchecked aliases remain verbatim. Omitting type uses the local form, as allowed by native project examples. VS Code's `.vscode/mcp.json`/`servers` schema is not an alias and is not discovered.
 
 Common portable fields are `command`, `args`, `env`, `url` and `headers`. Full same-native entries retain native fields such as `tools`, timeout values and secret placeholders. Tool availability lists are not permission approvals. Cross-agent conversion blocks non-portable tool restrictions, timeouts, dynamic substitutions and unknown execution-affecting fields rather than dropping them. The default all-tools list `['*']` is equivalent to native default availability. A foreign `cwd` cannot be represented through the documented common CLI fields and blocks conversion. Literal dollar-variable expressions from another client also block: Copilot's interpolation would change their meaning. Secrets are not resolved; no server, script, helper, registry command or authentication flow is run.
 
