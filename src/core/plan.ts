@@ -244,8 +244,8 @@ async function addDirsForDestination(builder: PlanBuilder, directory: string, bo
   const traversalRoot = rootSnapshot?.kind === 'missing' ? await nearestExistingDirectory(root) : root;
   while (isWithin(traversalRoot, current)) {
     const snapshot = expectedByPath.get(current) ?? await snapshotPath(current);
-    builder.addPrecondition(snapshot);
     if (snapshot.kind === 'directory') break;
+    builder.addPrecondition(snapshot);
     if (snapshot.kind !== 'missing') break;
     missing.push({ path: current, snapshot });
     if (current === traversalRoot) break;

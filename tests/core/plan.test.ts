@@ -345,7 +345,7 @@ it('blocks unmanaged MCP collisions, owned drift, and destination changes after 
     fingerprint: fingerprintValue(owned),
   }] };
   await mkdir(join(sandbox.context.configHome, 'mishmash', 'projects'), { recursive: true });
-  await mkdir(join(sandbox.context.stateHome, 'mishmash'), { recursive: true });
+  await mkdir(join(sandbox.context.stateHome, 'mishmash'), { recursive: true, mode: 0o700 });
   await writeFile(statePaths.ownershipPath, encodeOwnershipState(ownership), { mode: 0o600 });
   const changedState = await loadState();
   await putFile(targetPath, JSON.stringify({ mcpServers: { selected: { type: 'stdio', command: 'edited-out-of-band' } } }));
@@ -431,7 +431,7 @@ it('applies skill copies through safe parent symlinks and bootstraps absent XDG 
   expect(plan.operations.filter(operation => operation.kind === 'mkdir' && operation.path.startsWith(sandbox!.context.configHome))
     .every(operation => operation.kind === 'mkdir' && operation.mode === 0o700)).toBe(true);
   const result = await applyPlan(plan, { confirmed: true });
-  expect(result.status).toBe('applied');
+  expect(result.status, JSON.stringify(result.findings)).toBe('applied');
   const target = join(physicalOutput, 'skills', 'applied-through-alias');
   expect((await snapshotPath(target)).kind).toBe('directory');
   expect((await readFile(join(target, 'SKILL.md'), 'utf8')).includes('Safe alias destination')).toBe(true);
@@ -559,7 +559,7 @@ it('retargets an owned link before removing its old referent during apply', asyn
     sourceId: selected.source.id, resourceId: selected.id, fingerprint: previous.digest,
   }] };
   await mkdir(dirname(paths.preferencePath), { recursive: true });
-  await mkdir(dirname(paths.ownershipPath), { recursive: true });
+  await mkdir(dirname(paths.ownershipPath), { recursive: true, mode: 0o700 });
   await writeFile(paths.preferencePath, encodeAuthorityConfig(authority), { mode: 0o600 });
   await writeFile(paths.ownershipPath, encodeOwnershipState(ownership), { mode: 0o600 });
   const plan = await planSync(sandbox.context, inventory,
@@ -574,7 +574,8 @@ it('retargets an owned link before removing its old referent during apply', asyn
   expect(newFile).toBeGreaterThanOrEqual(0);
   expect(link).toBeGreaterThan(newFile);
   expect(obsolete).toBeGreaterThan(link);
-  expect((await applyPlan(plan, { confirmed: true })).status).toBe('applied');
+  const applied = await applyPlan(plan, { confirmed: true });
+  expect(applied.status, JSON.stringify(applied.findings)).toBe('applied');
   expect((await snapshotPath(join(target, 'old.txt'))).kind).toBe('missing');
   expect(await readFile(join(target, 'link'), 'utf8')).toBe('new referent');
 });
@@ -599,7 +600,7 @@ it('removes obsolete assets only inside the selected owned skill and keeps unrel
     sourceId: selected.source.id, resourceId: selected.id, fingerprint: oldOutput.digest,
   }] };
   await mkdir(dirname(paths.preferencePath), { recursive: true });
-  await mkdir(dirname(paths.ownershipPath), { recursive: true });
+  await mkdir(dirname(paths.ownershipPath), { recursive: true, mode: 0o700 });
   await writeFile(paths.preferencePath, encodeAuthorityConfig(authority), { mode: 0o600 });
   await writeFile(paths.ownershipPath, encodeOwnershipState(ownership), { mode: 0o600 });
   const beforePlan = await snapshotPath(sandbox.root);
@@ -634,7 +635,7 @@ it('produces a true no-op when copied output and both state records already matc
     sourceId: selected.source.id, resourceId: selected.id, fingerprint: targetSnapshot.digest,
   }] };
   await mkdir(dirname(statePaths.preferencePath), { recursive: true });
-  await mkdir(dirname(statePaths.ownershipPath), { recursive: true });
+  await mkdir(dirname(statePaths.ownershipPath), { recursive: true, mode: 0o700 });
   await writeFile(statePaths.preferencePath, encodeAuthorityConfig(preferences), { mode: 0o600 });
   await writeFile(statePaths.ownershipPath, encodeOwnershipState(ownership), { mode: 0o600 });
   const before = await snapshotPath(sandbox.root);
