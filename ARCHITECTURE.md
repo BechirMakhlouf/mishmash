@@ -43,7 +43,7 @@ Share the standard skill reader across native adapters and explicitly supplied s
 | --- | --- |
 | `Context` | Approved project/home/XDG roots, explicit placement/configuration scope, and cancellation signal where applicable |
 | `SourceRef` | Exact native/shared source location, agent associations, logical project/user scope and private/shared visibility |
-| `ResourceInstance` | Stable ID derived from source identity plus skill-relative path or MCP registration locator; includes name, description when present and provenance |
+| `ResourceInstance` | Stable ID from source identity plus skill-relative path or MCP registration locator **and, when parser semantics differ, native-agent interpretation**; includes description and provenance |
 | `Snapshot` | Separate content/tree fingerprint, entry types, supported modes, link targets and resolved parent identity |
 | `AuthoritySelection` | Explicit mapping from selected resources/conflicts to exact source instances; never infer authority from list order, timestamp or `.agents` |
 | `DestinationSlot` | Resolved physical path plus registration key when several resources share a configuration file |
@@ -51,7 +51,7 @@ Share the standard skill reader across native adapters and explicitly supplied s
 | `Plan` | Selected authorities, operations, resolved scopes/paths, warnings/blockers, expected snapshots and metadata write intents |
 | `ApplyResult` | Changed/unchanged/skipped resources and destinations, backup location, recovery status and safe findings |
 
-Resource identity is not a display name or content hash. A `SourceRef.id` is the normalized resolved source path plus logical scope and visibility; it excludes the discovering agent and label. Native adapters realpath existing source roots/configs before constructing `SourceRef`, while `CheckedLocation` retains the configured alias. Shared roots use `agentId: 'shared'` and retain detecting agents in provenance; compatibility paths retain their native owner. Same-name resources at different source identities remain separate; one physical source discovered by several agents is one instance with all provenance.
+Resource identity is not a display name or content hash. A `SourceRef.id` is the normalized resolved source path plus logical scope and visibility; it excludes the discovering agent and label. Native adapters realpath existing source roots/configs before constructing `SourceRef`, while `CheckedLocation` retains the configured alias. Shared skill roots use `agentId: 'shared'` and retain detecting agents in provenance; compatibility paths retain their native owner. Identical physical skills discovered via several adapters coalesce into one resource with all provenance. A shared MCP file can have agent-specific interpretation semantics; preserve those as distinct resource views when `nativeAgent` changes, even though the physical `SourceRef` is shared. Same-name resources at different sources or semantic interpretations remain distinct until explicit authority resolves them.
 
 Logical scope is not determined solely by file location: a project-private MCP entry may be stored under the home directory. Do not flatten user resources into project resources. Unclassified privacy must not become permission to publish globally.
 
@@ -125,6 +125,8 @@ Use syntax-aware editors appropriate to actual JSON/JSONC/TOML documents. Prepar
 
 Honor platform-appropriate XDG fallbacks. Use versioned JSON and explicit validation. Select the relevant authority configuration for review; do not silently combine conflicting project/private/user choices or use one as a missing-source fallback. Configuration scope and output placement are separate decisions.
 
+The shared project preference file must never contain a private `SourceRef` path or authority choice, even if the selected resource itself would not be copied into the project. If a reviewed selection includes a private user or private-project authority, persist it only in an explicitly chosen user-local/private-project configuration; if that configuration is not selected, block rather than leaking locators or silently splitting/repointing preferences.
+
 Preferences and receipts contain locators and fingerprints, not MCP bodies or credentials. Backup directories are owner-only; secret-bearing backup files are owner-readable/writable only. Preserve supported target modes independently. Include preference/receipt changes in the reviewed transaction. No directory, lock, state file, backup or `.gitignore` change occurs before confirmation. An unchanged rerun does not rewrite metadata or create a transaction directory just to log a no-op.
 
 ## 6. Read-only planning and recoverable application
@@ -150,6 +152,8 @@ Apply accepts the concrete confirmed plan, not unvalidated UI answers. Revalidat
 Make original data and journal intent durable before changing originals. Track file/link/directory changes and metadata as one recoverable transaction, using safe per-file replacement. Never claim filesystem-wide atomicity or that readers cannot observe intermediate tree changes.
 
 A global mishmash apply lock serializes mishmash writers and ownership updates, not external editors. Preconditions detect stale reviews and narrow races; they do not provide isolation against arbitrary concurrent processes. Rollback must not overwrite a new external edit: preserve recovery data, report a pending recovery, and block another apply until an explicit recovery decision.
+
+The apply lock is protected by a short-lived exclusive sibling guard during acquisition/reclamation; an owner-verified release never removes a replacement lock. A stranded, corrupt or unknown-owner guard blocks writes and is surfaced at its exact path. Do not auto-delete it: stop all mishmash writers, verify the recorded owner is inactive, then follow the documented recovery procedure. Reclaim a dead apply lock only through explicit recovery approval. Missing XDG state roots are created with private permissions only after confirmation; false confirmation and read-only planning create none. Completed journals remain available for backup/recovery history but no longer require their former project root to exist.
 
 Before apply, cancellation performs no writes. During apply, catchable cancellation requests safe settlement/recovery; do not call `process.exit()` in the middle of a write. On the next run, surface an interrupted journal before another apply. Do not claim a no-write cancellation if mutation began.
 
