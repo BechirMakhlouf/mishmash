@@ -1,0 +1,369 @@
+import { afterEach, expect, it } from 'vitest';
+import { cp, mkdir, rm, symlink, writeFile } from 'node:fs/promises';
+import { dirname, join, resolve } from 'node:path';
+import type { AgentId, AuthorityConfig, DestinationRequest, OwnershipState, ResourceInstance, SyncRequest } from '../../src/model.js';
+import { discover } from '../../src/core/discover.js';
+import { planSync } from '../../src/core/plan.js';
+import { fingerprintValue, snapshotMatches, snapshotPath } from '../../src/fs/snapshot.js';
+import { decodeAuthorityConfig, decodeOwnershipState, encodeAuthorityConfig, encodeOwnershipState, getStatePaths, readState } from '../../src/state.js';
+import { sourceRef } from '../../src/resources/skills.js';
+import { createSandbox, putFile, putSkill, type Sandbox } from '../helpers/sandbox.js';
+
+let sandbox: Sandbox | undefined;
+afterEach(async () => { await sandbox?.cleanup(); });
+
+const emptyAuthority = (): AuthorityConfig => ({ version: 1, sources: [], resourceAuthorities: {} });
+function request(resourceIds: readonly string[], destinations: readonly DestinationRequest[], extra: Partial<SyncRequest> = {}): SyncRequest {
+  return {
+    resourceIds, authority: emptyAuthority(), destinations, configuration: 'private-project', skillMode: 'copy', ...extra,
+  };
+}
+async function inventoryFor(box: Sandbox = sandbox!): Promise<Awaited<ReturnType<typeof discover>>> {
+  return discover(box.context);
+}
+async function loadState(box: Sandbox = sandbox!) { return readState(box.context, 'private-project'); }
+function skill(inventory: Awaited<ReturnType<typeof discover>>, name: string, sourcePath?: string): ResourceInstance {
+  const result = inventory.resources.find(resource => resource.kind === 'skill' && resource.name === name
+    && (!sourcePath || resource.path === sourcePath));
+  if (!result) throw new Error(`Expected discovered skill: ${name}`);
+  return result;
+}
+function mcp(inventory: Awaited<ReturnType<typeof discover>>, name: string, nativeAgent?: AgentId): ResourceInstance {
+  const result = inventory.resources.find(resource => resource.kind === 'mcp' && resource.name === name
+    && (!nativeAgent || (resource.kind === 'mcp' && resource.definition.nativeAgent === nativeAgent)));
+  if (!result) throw new Error(`Expected discovered MCP definition: ${name}`);
+  return result;
+}
+function resources(operations: Awaited<ReturnType<typeof planSync>>['operations']) {
+  return operations.filter(operation => operation.purpose === 'resource');
+}
+function stateContent(plan: Awaited<ReturnType<typeof planSync>>, pathIncludes: string): Uint8Array {
+  const operation = plan.operations.find(item => item.purpose === 'state' && item.kind === 'write' && item.path.includes(pathIncludes));
+  if (!operation || operation.kind !== 'write' || operation.content.kind !== 'bytes') throw new Error(`Expected planned state bytes: ${pathIncludes}`);
+  return operation.content.bytes;
+}
+
+it('requires an exact choice for divergent same-name sources and plans only the chosen tree', async () => {
+  sandbox = await createSandbox();
+  const nativeRoot = join(sandbox.context.projectRoot, '.claude', 'skills');
+  const sharedRoot = join(sandbox.context.projectRoot, '.agents', 'skills');
+  const native = await putSkill(nativeRoot, 'review', 'Native review guidance');
+  const shared = await putSkill(sharedRoot, 'review', 'Shared review guidance');
+  await putFile(join(native, 'assets', 'native-only'), 'native asset');
+  await putFile(join(shared, 'assets', 'shared-only'), 'shared asset');
+  const before = await snapshotPath(sandbox.root);
+  const inventory = await inventoryFor();
+  const nativeResource = skill(inventory, 'review', native);
+  const sharedResource = skill(inventory, 'review', shared);
+  const destination: DestinationRequest = { agentId: 'codex', placement: 'user' };
+  const unresolved = await planSync(sandbox.context, inventory,
+    request([nativeResource.id, sharedResource.id], [destination]), await loadState());
+  expect(unresolved.findings.some(finding => finding.code === 'AUTHORITY_REQUIRED')).toBe(true);
+
+  const approved = request([nativeResource.id, sharedResource.id], [destination], {
+    authority: { version: 1, sources: [nativeResource.source], resourceAuthorities: { 'skill:review': nativeResource.id } },
+  });
+  const plan = await planSync(sandbox.context, inventory, approved, await loadState());
+  expect(plan.findings.some(finding => finding.severity === 'error')).toBe(false);
+  const writes = resources(plan.operations).filter(operation => operation.kind === 'write' && operation.content.kind === 'source');
+  expect(writes.length).toBeGreaterThan(0);
+  expect(writes.every(operation => operation.kind === 'write' && operation.content.kind === 'source' && operation.content.path.startsWith(native))).toBe(true);
+  expect(writes.some(operation => operation.kind === 'write' && operation.content.kind === 'source' && operation.content.path.includes('shared-only'))).toBe(false);
+  expect(plan.summary.resources).toEqual([{ id: nativeResource.id, name: 'review', kind: 'skill' }]);
+  expect(plan.summary.authorities.map(source => source.id)).toEqual([nativeResource.source.id]);
+  expect(await snapshotMatches(before)).toBe(true);
+});
+
+it('plans complete copy trees with binary assets, empty directories, executable modes, and safe internal links', async () => {
+  sandbox = await createSandbox();
+  const root = join(sandbox.context.projectRoot, '.claude', 'skills');
+  const source = await putSkill(root, 'whole-tree', 'A complete skill');
+  await putFile(join(source, 'assets', 'bytes.bin'), new Uint8Array([0, 255, 4, 17]));
+  await putFile(join(source, 'scripts', 'inspect.sh'), '#!/bin/sh\nexit 97\n', 0o755);
+  await mkdir(join(source, 'references', 'empty', 'nested'), { recursive: true });
+  await symlink('scripts/inspect.sh', join(source, 'inspect-link'));
+  const before = await snapshotPath(sandbox.root);
+  const inventory = await inventoryFor();
+  const selected = skill(inventory, 'whole-tree', source);
+  const plan = await planSync(sandbox.context, inventory,
+    request([selected.id], [{ agentId: 'codex', placement: 'user' }]), await loadState());
+  expect(plan.findings.some(finding => finding.severity === 'error')).toBe(false);
+  const operations = resources(plan.operations);
+  expect(operations.some(operation => operation.kind === 'mkdir' && operation.path.endsWith('/references/empty/nested'))).toBe(true);
+  expect(operations.some(operation => operation.kind === 'write' && operation.path.endsWith('/scripts/inspect.sh') && operation.mode === 0o755)).toBe(true);
+  const binary = operations.find(operation => operation.kind === 'write' && operation.path.endsWith('/assets/bytes.bin'));
+  expect(binary?.kind === 'write' && binary.content.kind === 'source' && binary.content.snapshot.kind === 'file').toBe(true);
+  expect(operations.some(operation => operation.kind === 'symlink' && operation.path.endsWith('/inspect-link') && operation.target === 'scripts/inspect.sh')).toBe(true);
+  expect(operations.some(operation => operation.kind === 'write' && operation.path.endsWith('/SKILL.md'))).toBe(true);
+  expect(plan.summary.skillMode).toBe('copy');
+  expect(await snapshotMatches(before)).toBe(true);
+});
+
+it('plans links only when relevant and avoids a redundant link for an authority already discovered by the destination', async () => {
+  sandbox = await createSandbox();
+  const extraRoot = join(sandbox.context.projectRoot, 'provided-skills');
+  const source = await putSkill(extraRoot, 'external-guide', 'Explicit external guidance');
+  const discoveredRoot = join(sandbox.context.projectRoot, '.agents', 'skills');
+  const discoveredPath = await putSkill(discoveredRoot, 'already-authority', 'Already discovered guidance');
+  const inventory = await discover({
+    ...sandbox.context,
+    extraSources: [sourceRef('shared', extraRoot, 'project', 'shared', 'Explicit source')],
+  });
+  const selected = skill(inventory, 'external-guide', source);
+  const linkPlan = await planSync(sandbox.context, inventory,
+    request([selected.id], [{ agentId: 'gemini-cli', placement: 'user' }], { skillMode: 'link' }), await loadState());
+  expect(linkPlan.findings.some(finding => finding.severity === 'error')).toBe(false);
+  expect(resources(linkPlan.operations).some(operation => operation.kind === 'symlink')).toBe(true);
+
+  const alreadySelected = skill(inventory, 'already-authority', discoveredPath);
+  const alreadyDiscovered = await planSync(sandbox.context, inventory,
+    request([alreadySelected.id], [{ agentId: 'codex', placement: 'project' }], { skillMode: 'link' }), await loadState());
+  expect(resources(alreadyDiscovered.operations)).toEqual([]);
+  expect(alreadyDiscovered.summary.unchanged).toBe(1);
+});
+
+it('blocks private-project publication and destinations reached through escaping parent symlinks', async () => {
+  sandbox = await createSandbox();
+  const privateRoot = join(sandbox.context.projectRoot, 'private-skills');
+  const privateSkill = await putSkill(privateRoot, 'private-guide', 'Private project guidance');
+  const privateInventory = await discover({
+    ...sandbox.context,
+    extraSources: [sourceRef('shared', privateRoot, 'project', 'private', 'Private project skills')],
+  });
+  const selected = skill(privateInventory, 'private-guide', privateSkill);
+  const privatePlan = await planSync(sandbox.context, privateInventory,
+    request([selected.id], [{ agentId: 'codex', placement: 'project' }]), await loadState());
+  expect(privatePlan.findings.some(finding => finding.code === 'PRIVATE_RESOURCE_PUBLICATION')).toBe(true);
+  expect(resources(privatePlan.operations)).toEqual([]);
+
+  const userSource = await putSkill(join(sandbox.context.homeDir, '.claude', 'skills'), 'personal-guide', 'Private user guidance');
+  const userInventory = await inventoryFor();
+  const userResource = skill(userInventory, 'personal-guide', userSource);
+  const privateUserPlan = await planSync(sandbox.context, userInventory,
+    request([userResource.id], [{ agentId: 'codex', placement: 'user' }]), await loadState());
+  expect(privateUserPlan.findings.some(finding => finding.severity === 'error')).toBe(false);
+  expect(resources(privateUserPlan.operations).some(operation => operation.path.startsWith(sandbox!.context.homeDir))).toBe(true);
+  const published = await planSync(sandbox.context, userInventory,
+    request([userResource.id], [{ agentId: 'codex', placement: 'project' }]), await loadState());
+  expect(published.findings.some(finding => finding.code === 'PRIVATE_RESOURCE_PUBLICATION')).toBe(true);
+
+  const outside = join(sandbox.root, 'outside-project');
+  await mkdir(outside, { recursive: true });
+  await symlink(outside, join(sandbox.context.projectRoot, '.agents'));
+  const ordinaryRoot = join(sandbox.context.projectRoot, '.claude', 'skills');
+  const ordinary = await putSkill(ordinaryRoot, 'ordinary', 'Public project guidance');
+  const inventory = await inventoryFor();
+  const resource = skill(inventory, 'ordinary', ordinary);
+  const unsafe = await planSync(sandbox.context, inventory,
+    request([resource.id], [{ agentId: 'codex', placement: 'project' }]), await loadState());
+  expect(unsafe.findings.some(finding => finding.code === 'UNSAFE_DESTINATION_PATH')).toBe(true);
+  expect(resources(unsafe.operations)).toEqual([]);
+});
+
+it('blocks an unmanaged skill collision and selected-source drift without overwriting either', async () => {
+  sandbox = await createSandbox();
+  const sourceRoot = join(sandbox.context.projectRoot, '.claude', 'skills');
+  const source = await putSkill(sourceRoot, 'collision', 'Authoritative source');
+  const target = join(sandbox.context.homeDir, '.agents', 'skills', 'collision');
+  await putSkill(join(sandbox.context.homeDir, '.agents', 'skills'), 'collision', 'Existing unmanaged destination');
+  const inventory = await inventoryFor();
+  const selected = skill(inventory, 'collision', source);
+  const collision = await planSync(sandbox.context, inventory,
+    request([selected.id], [{ agentId: 'codex', placement: 'user' }]), await loadState());
+  expect(collision.findings.some(finding => finding.code === 'UNMANAGED_DESTINATION_COLLISION' && finding.path === target)).toBe(true);
+  expect(resources(collision.operations).some(operation => operation.path.startsWith(target))).toBe(false);
+
+  await putFile(join(source, 'assets', 'changed-after-discovery'), 'stale source');
+  const stale = await planSync(sandbox.context, inventory,
+    request([selected.id], [{ agentId: 'pi', placement: 'user' }]), await loadState());
+  expect(stale.findings.some(finding => finding.code === 'STALE_SOURCE' && finding.path === source)).toBe(true);
+});
+
+it('requires an explicit authority for cross-adapter native MCP interpretations', async () => {
+  sandbox = await createSandbox();
+  await putFile(join(sandbox.context.projectRoot, '.mcp.json'), JSON.stringify({
+    mcpServers: { variant: { type: 'stdio', command: 'source-command' } },
+  }));
+  const inventory = await inventoryFor();
+  const claude = mcp(inventory, 'variant', 'claude-code');
+  const copilot = mcp(inventory, 'variant', 'github-copilot-cli');
+  expect(claude.id).not.toBe(copilot.id);
+  expect(claude.source.id).toBe(copilot.source.id);
+  const destination: DestinationRequest = { agentId: 'gemini-cli', placement: 'project' };
+  const unresolved = await planSync(sandbox.context, inventory,
+    request([claude.id, copilot.id], [destination]), await loadState());
+  expect(unresolved.findings.some(finding => finding.code === 'AUTHORITY_REQUIRED')).toBe(true);
+
+  const approved = await planSync(sandbox.context, inventory,
+    request([claude.id, copilot.id], [destination], {
+      authority: { version: 1, sources: [claude.source], resourceAuthorities: { 'mcp:variant': claude.id } },
+    }), await loadState());
+  expect(approved.findings.some(finding => finding.severity === 'error')).toBe(false);
+  expect(approved.summary.resources.map(resource => resource.id)).toEqual([claude.id]);
+  expect(resources(approved.operations).some(operation => operation.kind === 'write'
+    && operation.path === join(sandbox!.context.projectRoot, '.gemini', 'settings.json'))).toBe(true);
+});
+
+it('coalesces selected MCP edits into one native file while preserving unchecked registrations and settings', async () => {
+  sandbox = await createSandbox();
+  const sourcePath = join(sandbox.context.projectRoot, '.mcp.json');
+  await putFile(sourcePath, JSON.stringify({ mcpServers: {
+    alpha: { type: 'stdio', command: 'alpha-command' },
+    beta: { type: 'stdio', command: 'beta-command' },
+    sourceUnchecked: { type: 'stdio', command: 'never-copy' },
+  } }));
+  const targetPath = join(sandbox.context.projectRoot, '.gemini', 'settings.json');
+  await putFile(targetPath, JSON.stringify({ ui: { theme: 'native' }, mcpServers: { targetUnchecked: { command: 'leave-in-place' } } }));
+  const before = await snapshotPath(sandbox.root);
+  const inventory = await inventoryFor();
+  const selected = ['alpha', 'beta'].map(name => mcp(inventory, name, 'claude-code'));
+  const plan = await planSync(sandbox.context, inventory,
+    request(selected.map(resource => resource.id), [{ agentId: 'gemini-cli', placement: 'project' }]), await loadState());
+  expect(plan.findings.some(finding => finding.severity === 'error')).toBe(false);
+  const nativeWrites = resources(plan.operations).filter(operation => operation.kind === 'write' && operation.path === targetPath);
+  expect(nativeWrites).toHaveLength(1);
+  expect(nativeWrites[0]?.kind === 'write' && nativeWrites[0].content.kind === 'bytes').toBe(true);
+  if (!nativeWrites[0] || nativeWrites[0].kind !== 'write' || nativeWrites[0].content.kind !== 'bytes') throw new Error('Expected coalesced native config bytes');
+  const output = JSON.parse(Buffer.from(nativeWrites[0].content.bytes).toString('utf8')) as {
+    ui: { theme: string }; mcpServers: Record<string, { command: string }>;
+  };
+  expect(output.ui.theme).toBe('native');
+  expect(output.mcpServers.alpha?.command).toBe('alpha-command');
+  expect(output.mcpServers.beta?.command).toBe('beta-command');
+  expect(output.mcpServers.targetUnchecked?.command).toBe('leave-in-place');
+  expect(output.mcpServers.sourceUnchecked).toBeUndefined();
+  expect(await snapshotMatches(before)).toBe(true);
+});
+
+it('blocks unmanaged MCP collisions, owned drift, and destination changes after state was read', async () => {
+  sandbox = await createSandbox();
+  const sourcePath = join(sandbox.context.projectRoot, '.mcp.json');
+  await putFile(sourcePath, JSON.stringify({ mcpServers: { selected: { type: 'stdio', command: 'source-command' } } }));
+  const targetPath = join(sandbox.context.projectRoot, '.gemini', 'settings.json');
+  await putFile(targetPath, JSON.stringify({ mcpServers: { selected: { type: 'stdio', command: 'unmanaged-command' } } }));
+  const inventory = await inventoryFor();
+  const selected = mcp(inventory, 'selected', 'claude-code');
+  const destination: DestinationRequest = { agentId: 'gemini-cli', placement: 'project' };
+  const collision = await planSync(sandbox.context, inventory, request([selected.id], [destination]), await loadState());
+  expect(collision.findings.some(finding => finding.code === 'UNMANAGED_MCP_COLLISION' && finding.path === targetPath)).toBe(true);
+  expect(resources(collision.operations).some(operation => operation.path === targetPath)).toBe(false);
+
+  const owned = { type: 'stdio', command: 'prior-owned-output' };
+  await putFile(targetPath, JSON.stringify({ mcpServers: { selected: owned } }));
+  const targetSnapshot = await snapshotPath(targetPath);
+  const statePaths = await getStatePaths(sandbox.context, 'private-project');
+  const ownership: OwnershipState = { version: 1, receipts: [{
+    slotId: fingerprintValue([targetSnapshot.resolvedPath, 'mcp', JSON.stringify(['mcpServers', 'selected'])]),
+    path: targetPath, kind: 'mcp', key: 'selected', sourceId: selected.source.id, resourceId: selected.id,
+    fingerprint: fingerprintValue(owned),
+  }] };
+  await mkdir(join(sandbox.context.configHome, 'mishmash', 'projects'), { recursive: true });
+  await mkdir(join(sandbox.context.stateHome, 'mishmash'), { recursive: true });
+  await writeFile(statePaths.ownershipPath, encodeOwnershipState(ownership), { mode: 0o600 });
+  const changedState = await loadState();
+  await putFile(targetPath, JSON.stringify({ mcpServers: { selected: { type: 'stdio', command: 'edited-out-of-band' } } }));
+  const drift = await planSync(sandbox.context, inventory, request([selected.id], [destination]), changedState);
+  expect(drift.findings.some(finding => finding.code === 'OWNED_MCP_DRIFT')).toBe(true);
+
+  const readBeforeMutation = await loadState();
+  await putFile(readBeforeMutation.preferencePath, JSON.stringify({ version: 1, sources: [], resourceAuthorities: {} }));
+  const staleState = await planSync(sandbox.context, inventory, request([selected.id], [destination]), readBeforeMutation);
+  expect(staleState.findings.some(finding => finding.code === 'STALE_STATE')).toBe(true);
+});
+
+it('plans safe preference and ownership intents while preserving unrelated remembered choices without credentials', async () => {
+  sandbox = await createSandbox();
+  const sourceRoot = join(sandbox.context.projectRoot, '.claude', 'skills');
+  const source = await putSkill(sourceRoot, 'remembered', 'Remembered source');
+  const inventory = await inventoryFor();
+  const selected = skill(inventory, 'remembered', source);
+  const paths = await getStatePaths(sandbox.context, 'private-project');
+  const previous: AuthorityConfig = {
+    version: 1, sources: [sourceRef('shared', join(sandbox.root, 'retained-source'), 'user', 'private', 'Retained source')],
+    resourceAuthorities: { 'skill:elsewhere': 'retained-resource-id' },
+  };
+  await mkdir(dirname(paths.preferencePath), { recursive: true });
+  await writeFile(paths.preferencePath, encodeAuthorityConfig(previous), { mode: 0o600 });
+  const plan = await planSync(sandbox.context, inventory,
+    request([selected.id], [{ agentId: 'codex', placement: 'user' }], {
+      authority: { version: 1, sources: [selected.source], resourceAuthorities: { 'skill:remembered': selected.id } },
+    }), await loadState());
+  expect(plan.findings.some(finding => finding.severity === 'error')).toBe(false);
+  const choices = decodeAuthorityConfig(JSON.parse(Buffer.from(stateContent(plan, '/projects/')).toString('utf8')) as unknown);
+  expect(choices.resourceAuthorities['skill:elsewhere']).toBe('retained-resource-id');
+  expect(choices.resourceAuthorities['skill:remembered']).toBe(selected.id);
+  expect(choices.sources.some(sourceRef => sourceRef.id === selected.source.id)).toBe(true);
+  const ownership = decodeOwnershipState(JSON.parse(Buffer.from(stateContent(plan, '/mishmash/ownership.json')).toString('utf8')) as unknown);
+  expect(ownership.receipts.some(receipt => receipt.kind === 'skill' && receipt.resourceId === selected.id)).toBe(true);
+  expect(JSON.stringify({ summary: plan.summary, findings: plan.findings, receipts: ownership.receipts, choices })).not.toContain('credential-marker');
+  expect(plan.operations.filter(operation => operation.purpose === 'state').every(operation => operation.kind === 'mkdir' || operation.kind === 'write')).toBe(true);
+});
+
+it('removes obsolete assets only inside the selected owned skill and keeps unrelated destination skills', async () => {
+  sandbox = await createSandbox();
+  const source = await putSkill(join(sandbox.context.projectRoot, '.claude', 'skills'), 'maintained', 'Maintained guidance');
+  await putFile(join(source, 'stable.txt'), 'still selected');
+  await putFile(join(source, 'obsolete.txt'), 'old selected asset');
+  const target = join(sandbox.context.homeDir, '.agents', 'skills', 'maintained');
+  await mkdir(dirname(target), { recursive: true });
+  await cp(source, target, { recursive: true });
+  await putSkill(join(sandbox.context.homeDir, '.agents', 'skills'), 'unchecked', 'Unselected output');
+  await rm(join(source, 'obsolete.txt'));
+  const inventory = await inventoryFor();
+  const selected = skill(inventory, 'maintained', source);
+  const oldOutput = await snapshotPath(target);
+  const paths = await getStatePaths(sandbox.context, 'private-project');
+  const authority: AuthorityConfig = { version: 1, sources: [selected.source], resourceAuthorities: { 'skill:maintained': selected.id } };
+  const ownership: OwnershipState = { version: 1, receipts: [{
+    slotId: fingerprintValue([resolve(target), 'skill']), path: target, kind: 'skill', key: 'maintained',
+    sourceId: selected.source.id, resourceId: selected.id, fingerprint: oldOutput.digest,
+  }] };
+  await mkdir(dirname(paths.preferencePath), { recursive: true });
+  await mkdir(dirname(paths.ownershipPath), { recursive: true });
+  await writeFile(paths.preferencePath, encodeAuthorityConfig(authority), { mode: 0o600 });
+  await writeFile(paths.ownershipPath, encodeOwnershipState(ownership), { mode: 0o600 });
+  const beforePlan = await snapshotPath(sandbox.root);
+  const plan = await planSync(sandbox.context, inventory,
+    request([selected.id], [{ agentId: 'codex', placement: 'user' }], {
+      authority: { version: 1, sources: [selected.source], resourceAuthorities: { 'skill:maintained': selected.id } },
+    }), await loadState());
+  expect(plan.findings.some(finding => finding.severity === 'error')).toBe(false);
+  expect(resources(plan.operations).some(operation => operation.kind === 'remove' && operation.path === join(target, 'obsolete.txt'))).toBe(true);
+  expect(resources(plan.operations).some(operation => operation.path.includes('/unchecked/'))).toBe(false);
+  expect(plan.summary.removals).toBe(1);
+  const receipts = decodeOwnershipState(JSON.parse(Buffer.from(stateContent(plan, '/mishmash/ownership.json')).toString('utf8')) as unknown);
+  expect(receipts.receipts.find(receipt => receipt.resourceId === selected.id)?.fingerprint).toBe(selected.snapshot.digest);
+  expect(await snapshotMatches(beforePlan)).toBe(true);
+});
+
+it('produces a true no-op when copied output and both state records already match', async () => {
+  sandbox = await createSandbox();
+  const sourceRoot = join(sandbox.context.projectRoot, '.claude', 'skills');
+  const source = await putSkill(sourceRoot, 'unchanged', 'Stable skill');
+  await putFile(join(source, 'assets', 'stable.bin'), new Uint8Array([0, 1, 255]));
+  const inventory = await inventoryFor();
+  const selected = skill(inventory, 'unchanged', source);
+  const target = join(sandbox.context.homeDir, '.agents', 'skills', 'unchanged');
+  await mkdir(dirname(target), { recursive: true });
+  await cp(source, target, { recursive: true });
+  const targetSnapshot = await snapshotPath(target);
+  const statePaths = await getStatePaths(sandbox.context, 'private-project');
+  const preferences: AuthorityConfig = { version: 1, sources: [selected.source], resourceAuthorities: { 'skill:unchanged': selected.id } };
+  const ownership: OwnershipState = { version: 1, receipts: [{
+    slotId: fingerprintValue([resolve(target), 'skill']), path: target, kind: 'skill', key: 'unchanged',
+    sourceId: selected.source.id, resourceId: selected.id, fingerprint: targetSnapshot.digest,
+  }] };
+  await mkdir(dirname(statePaths.preferencePath), { recursive: true });
+  await mkdir(dirname(statePaths.ownershipPath), { recursive: true });
+  await writeFile(statePaths.preferencePath, encodeAuthorityConfig(preferences), { mode: 0o600 });
+  await writeFile(statePaths.ownershipPath, encodeOwnershipState(ownership), { mode: 0o600 });
+  const before = await snapshotPath(sandbox.root);
+  const plan = await planSync(sandbox.context, inventory,
+    request([selected.id], [{ agentId: 'codex', placement: 'user' }], {
+      authority: { version: 1, sources: [selected.source], resourceAuthorities: { 'skill:unchanged': selected.id } },
+    }), await loadState());
+  expect(plan.findings.some(finding => finding.severity === 'error')).toBe(false);
+  expect(plan.operations).toEqual([]);
+  expect(plan.summary.unchanged).toBe(1);
+  expect(await snapshotMatches(before)).toBe(true);
+});
