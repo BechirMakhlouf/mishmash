@@ -543,13 +543,20 @@ it('retargets an owned link before removing its old referent during apply', asyn
   sandbox = await createSandbox();
   const source = await putSkill(join(sandbox.context.projectRoot, '.claude', 'skills'), 'link-update', 'Linked asset update');
   await putFile(join(source, 'old.txt'), 'obsolete referent');
+  await symlink('old.txt', join(source, 'a'));
+  await symlink('a', join(source, 'link'));
   const target = join(sandbox.context.homeDir, '.agents', 'skills', 'link-update');
   await mkdir(dirname(target), { recursive: true });
-  await cp(source, target, { recursive: true });
+  await mkdir(target, { recursive: true });
+  await writeFile(join(target, 'SKILL.md'), await readFile(join(source, 'SKILL.md')));
+  await putFile(join(target, 'old.txt'), 'obsolete referent');
+  await symlink('old.txt', join(target, 'a'));
+  await symlink('a', join(target, 'link'));
   const previous = await snapshotPath(target);
   await rm(join(source, 'old.txt'));
   await putFile(join(source, 'new.txt'), 'new referent');
-  await symlink('new.txt', join(source, 'link'));
+  await rm(join(source, 'a'));
+  await symlink('new.txt', join(source, 'a'));
   const inventory = await inventoryFor();
   const selected = skill(inventory, 'link-update', source);
   const paths = await getStatePaths(sandbox.context, 'private-project');
@@ -566,18 +573,62 @@ it('retargets an owned link before removing its old referent during apply', asyn
     request([selected.id], [{ agentId: 'codex', placement: 'user' }], {
       authority: { version: 1, sources: [selected.source], resourceAuthorities: { 'skill:link-update': selected.id } },
     }), await loadState());
-  expect(plan.findings.some(finding => finding.severity === 'error')).toBe(false);
+  expect(plan.findings.some(finding => finding.severity === 'error'), JSON.stringify(plan.findings)).toBe(false);
   const operations = resources(plan.operations);
   const newFile = operations.findIndex(operation => operation.kind === 'write' && operation.path === join(target, 'new.txt'));
-  const link = operations.findIndex(operation => operation.kind === 'symlink' && operation.path === join(target, 'link'));
+  const link = operations.findIndex(operation => operation.kind === 'symlink' && operation.path === join(target, 'a'));
   const obsolete = operations.findIndex(operation => operation.kind === 'remove' && operation.path === join(target, 'old.txt'));
   expect(newFile).toBeGreaterThanOrEqual(0);
   expect(link).toBeGreaterThan(newFile);
   expect(obsolete).toBeGreaterThan(link);
+  expect(operations.some(operation => operation.kind === 'symlink' && operation.path === join(target, 'link'))).toBe(false);
+  expect(plan.preconditions.some(snapshot => snapshot.path === join(target, 'link'))).toBe(false);
   const applied = await applyPlan(plan, { confirmed: true });
   expect(applied.status, JSON.stringify(applied.findings)).toBe('applied');
   expect((await snapshotPath(join(target, 'old.txt'))).kind).toBe('missing');
   expect(await readFile(join(target, 'link'), 'utf8')).toBe('new referent');
+});
+
+it('removes obsolete symlinks before their referents during apply', async () => {
+  sandbox = await createSandbox();
+  const source = await putSkill(join(sandbox.context.projectRoot, '.claude', 'skills'), 'obsolete-link', 'Old link source');
+  await putFile(join(source, 'a.txt'), 'obsolete referent');
+  await symlink('a.txt', join(source, 'z-link'));
+  const target = join(sandbox.context.homeDir, '.agents', 'skills', 'obsolete-link');
+  await mkdir(dirname(target), { recursive: true });
+  await mkdir(target, { recursive: true });
+  await writeFile(join(target, 'SKILL.md'), await readFile(join(source, 'SKILL.md')));
+  await putFile(join(target, 'a.txt'), 'obsolete referent');
+  await symlink('a.txt', join(target, 'z-link'));
+  const oldOutput = await snapshotPath(target);
+  await rm(join(source, 'a.txt'));
+  await rm(join(source, 'z-link'));
+  const inventory = await inventoryFor();
+  const selected = skill(inventory, 'obsolete-link', source);
+  const paths = await getStatePaths(sandbox.context, 'private-project');
+  const authority: AuthorityConfig = { version: 1, sources: [selected.source], resourceAuthorities: { 'skill:obsolete-link': selected.id } };
+  const ownership: OwnershipState = { version: 1, receipts: [{
+    slotId: fingerprintValue([resolve(target), 'skill']), path: resolve(target), kind: 'skill', key: 'obsolete-link',
+    sourceId: selected.source.id, resourceId: selected.id, fingerprint: oldOutput.digest,
+  }] };
+  await mkdir(dirname(paths.preferencePath), { recursive: true });
+  await mkdir(dirname(paths.ownershipPath), { recursive: true, mode: 0o700 });
+  await writeFile(paths.preferencePath, encodeAuthorityConfig(authority), { mode: 0o600 });
+  await writeFile(paths.ownershipPath, encodeOwnershipState(ownership), { mode: 0o600 });
+  const plan = await planSync(sandbox.context, inventory,
+    request([selected.id], [{ agentId: 'codex', placement: 'user' }], {
+      authority: { version: 1, sources: [selected.source], resourceAuthorities: { 'skill:obsolete-link': selected.id } },
+    }), await loadState());
+  expect(plan.findings.some(finding => finding.severity === 'error'), JSON.stringify(plan.findings)).toBe(false);
+  const operations = resources(plan.operations);
+  const removeLink = operations.findIndex(operation => operation.kind === 'remove' && operation.path === join(target, 'z-link'));
+  const removeReferent = operations.findIndex(operation => operation.kind === 'remove' && operation.path === join(target, 'a.txt'));
+  expect(removeLink).toBeGreaterThanOrEqual(0);
+  expect(removeReferent).toBeGreaterThan(removeLink);
+  const result = await applyPlan(plan, { confirmed: true });
+  expect(result.status, JSON.stringify(result.findings)).toBe('applied');
+  expect((await snapshotPath(join(target, 'z-link'))).kind).toBe('missing');
+  expect((await snapshotPath(join(target, 'a.txt'))).kind).toBe('missing');
 });
 
 it('removes obsolete assets only inside the selected owned skill and keeps unrelated destination skills', async () => {

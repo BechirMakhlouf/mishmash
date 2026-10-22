@@ -231,7 +231,40 @@ function orderOperations(operations: readonly Operation[], findings: Finding[]):
         pending.delete(path);
       }
     }
-    result.push(...group.filter(operation => operation.kind === 'remove').sort(compareOperations));
+    const removals = group.filter((operation): operation is Extract<Operation, { kind: 'remove' }> => operation.kind === 'remove');
+    const linkRemovals = removals.filter(operation => operation.expected.kind === 'symlink');
+    const linkPaths = new Set(linkRemovals.map(operation => resolve(operation.path)));
+    const edges = new Map<string, string[]>();
+    const indegree = new Map([...linkPaths].map(path => [path, 0]));
+    for (const operation of linkRemovals) {
+      const path = resolve(operation.path);
+      const target = resolve(dirname(path), operation.expected.linkTarget ?? '');
+      const targets = [...linkPaths].filter(candidate => isWithin(candidate, target));
+      edges.set(path, targets);
+      for (const candidate of targets) indegree.set(candidate, (indegree.get(candidate) ?? 0) + 1);
+    }
+    const readyRemovals = [...linkPaths].filter(path => indegree.get(path) === 0).sort();
+    const orderedLinkRemovals: Operation[] = [];
+    while (readyRemovals.length) {
+      const path = readyRemovals.shift()!;
+      const operation = linkRemovals.find(item => resolve(item.path) === path)!;
+      orderedLinkRemovals.push(operation);
+      for (const dependency of edges.get(path) ?? []) {
+        const count = (indegree.get(dependency) ?? 0) - 1;
+        indegree.set(dependency, count);
+        if (count === 0) {
+          readyRemovals.push(dependency);
+          readyRemovals.sort();
+        }
+      }
+    }
+    if (orderedLinkRemovals.length !== linkRemovals.length) {
+      const path = [...linkPaths].filter(item => !orderedLinkRemovals.some(operation => resolve(operation.path) === item)).sort()[0]!;
+      findings.push(issue('SYMLINK_REMOVAL_CYCLE', 'Obsolete skill links contain a removal dependency cycle.', path));
+      orderedLinkRemovals.push(...linkRemovals.filter(operation => !orderedLinkRemovals.includes(operation)).sort((a, b) => a.path.localeCompare(b.path)));
+    }
+    result.push(...orderedLinkRemovals);
+    result.push(...removals.filter(operation => operation.expected.kind !== 'symlink').sort(compareOperations));
   }
   return result;
 }
@@ -240,15 +273,21 @@ async function addDirsForDestination(builder: PlanBuilder, directory: string, bo
   const missing: { path: string; snapshot: PathSnapshot }[] = [];
   let current = resolve(directory);
   const root = resolve(boundary);
-  const rootSnapshot = includeBoundaryParents ? await snapshotPath(root) : undefined;
-  const traversalRoot = rootSnapshot?.kind === 'missing' ? await nearestExistingDirectory(root) : root;
-  while (isWithin(traversalRoot, current)) {
+  let traversalRoot = root;
+  if (includeBoundaryParents) {
+    try {
+      if (!(await stat(root)).isDirectory()) throw new Error('Approved config root is not a directory.');
+    } catch (error) {
+      if (errorCode(error) !== 'ENOENT' && errorCode(error) !== 'ENOTDIR') throw error;
+      traversalRoot = await nearestExistingDirectory(root);
+    }
+  }
+  while (isWithin(traversalRoot, current) && current !== traversalRoot) {
     const snapshot = expectedByPath.get(current) ?? await snapshotPath(current);
     if (snapshot.kind === 'directory') break;
     builder.addPrecondition(snapshot);
     if (snapshot.kind !== 'missing') break;
     missing.push({ path: current, snapshot });
-    if (current === traversalRoot) break;
     const parent = dirname(current);
     if (parent === current) break;
     current = parent;
@@ -442,6 +481,7 @@ async function skillPlan(
       return;
     }
     const existingEntry = currentByPath.get(entry.relativePath);
+    if (entry.kind === 'symlink' && existingEntry?.kind === 'symlink' && existingEntry.linkTarget === entry.linkTarget) continue;
     const expected = entry.relativePath === '' ? current : await snapshotPath(path);
     builder.addPrecondition(expected);
     if (!existingEntry) {
