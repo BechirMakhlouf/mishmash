@@ -444,7 +444,10 @@ export async function validateReview(operations: readonly Operation[], precondit
   for (const source of preconditions) {
     if (source.kind !== 'directory' || !operations.some(operation => operation.kind === 'write' && operation.content.kind === 'source' && isWithin(source.path, operation.content.path))) continue;
     for (const entry of source.entries) {
-      if (entry.kind === 'other' || (entry.kind === 'symlink' && (isAbsolute(entry.linkTarget!) || !isWithin(source.resolvedPath, resolve(source.resolvedPath, dirname(entry.relativePath), entry.linkTarget!))))) throw new TransactionError('UNSAFE_SOURCE_TREE', source.path);
+      if (entry.kind === 'other') throw new TransactionError('UNSAFE_SOURCE_TREE', source.path);
+      if (entry.kind !== 'symlink') continue;
+      const resolved = await resolvePhysical(join(source.path, entry.relativePath));
+      if (isAbsolute(entry.linkTarget!) || !isWithin(source.resolvedPath, resolved)) throw new TransactionError('UNSAFE_SOURCE_TREE', source.path);
     }
   }
 }
