@@ -589,6 +589,57 @@ it('retargets an owned link before removing its old referent during apply', asyn
   expect(await readFile(join(target, 'link'), 'utf8')).toBe('new referent');
 });
 
+it('removes an obsolete symlink before retargeting its intermediate link during apply', async () => {
+  sandbox = await createSandbox();
+  const source = await putSkill(join(sandbox.context.projectRoot, '.claude', 'skills'), 'link-chain-update', 'Link chain update');
+  await putFile(join(source, 'old.txt'), 'old referent');
+  await symlink('old.txt', join(source, 'a'));
+  await symlink('a', join(source, 'obsolete'));
+  const target = join(sandbox.context.homeDir, '.agents', 'skills', 'link-chain-update');
+  await mkdir(dirname(target), { recursive: true });
+  await mkdir(target, { recursive: true });
+  await writeFile(join(target, 'SKILL.md'), await readFile(join(source, 'SKILL.md')));
+  await putFile(join(target, 'old.txt'), 'old referent');
+  await symlink('old.txt', join(target, 'a'));
+  await symlink('a', join(target, 'obsolete'));
+  const previous = await snapshotPath(target);
+  await rm(join(source, 'old.txt'));
+  await putFile(join(source, 'new.txt'), 'new referent');
+  await rm(join(source, 'a'));
+  await symlink('new.txt', join(source, 'a'));
+  await rm(join(source, 'obsolete'));
+  const inventory = await inventoryFor();
+  const selected = skill(inventory, 'link-chain-update', source);
+  const paths = await getStatePaths(sandbox.context, 'private-project');
+  const authority: AuthorityConfig = { version: 1, sources: [selected.source], resourceAuthorities: { 'skill:link-chain-update': selected.id } };
+  const ownership: OwnershipState = { version: 1, receipts: [{
+    slotId: fingerprintValue([resolve(target), 'skill']), path: resolve(target), kind: 'skill', key: 'link-chain-update',
+    sourceId: selected.source.id, resourceId: selected.id, fingerprint: previous.digest,
+  }] };
+  await mkdir(dirname(paths.preferencePath), { recursive: true });
+  await mkdir(dirname(paths.ownershipPath), { recursive: true, mode: 0o700 });
+  await writeFile(paths.preferencePath, encodeAuthorityConfig(authority), { mode: 0o600 });
+  await writeFile(paths.ownershipPath, encodeOwnershipState(ownership), { mode: 0o600 });
+  const plan = await planSync(sandbox.context, inventory,
+    request([selected.id], [{ agentId: 'codex', placement: 'user' }], {
+      authority: { version: 1, sources: [selected.source], resourceAuthorities: { 'skill:link-chain-update': selected.id } },
+    }), await loadState());
+  expect(plan.findings.some(finding => finding.severity === 'error'), JSON.stringify(plan.findings)).toBe(false);
+  const operations = resources(plan.operations);
+  const newFile = operations.findIndex(operation => operation.kind === 'write' && operation.path === join(target, 'new.txt'));
+  const removeLink = operations.findIndex(operation => operation.kind === 'remove' && operation.path === join(target, 'obsolete'));
+  const retarget = operations.findIndex(operation => operation.kind === 'symlink' && operation.path === join(target, 'a'));
+  const removeOld = operations.findIndex(operation => operation.kind === 'remove' && operation.path === join(target, 'old.txt'));
+  expect(newFile).toBeGreaterThanOrEqual(0);
+  expect(removeLink).toBeGreaterThan(newFile);
+  expect(retarget).toBeGreaterThan(removeLink);
+  expect(removeOld).toBeGreaterThan(retarget);
+  const result = await applyPlan(plan, { confirmed: true });
+  expect(result.status, JSON.stringify(result.findings)).toBe('applied');
+  expect((await snapshotPath(join(target, 'obsolete'))).kind).toBe('missing');
+  expect(await readFile(join(target, 'a'), 'utf8')).toBe('new referent');
+});
+
 it('removes obsolete symlinks before their referents during apply', async () => {
   sandbox = await createSandbox();
   const source = await putSkill(join(sandbox.context.projectRoot, '.claude', 'skills'), 'obsolete-link', 'Old link source');
