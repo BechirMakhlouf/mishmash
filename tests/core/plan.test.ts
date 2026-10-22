@@ -1,5 +1,5 @@
 import { afterEach, expect, it } from 'vitest';
-import { cp, mkdir, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { cp, mkdir, readFile, readlink, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import type { AgentId, AuthorityConfig, DestinationRequest, OwnershipState, ResourceInstance, SyncRequest } from '../../src/model.js';
 import { discover } from '../../src/core/discover.js';
@@ -82,7 +82,8 @@ it('plans complete copy trees with binary assets, empty directories, executable 
   await putFile(join(source, 'assets', 'bytes.bin'), new Uint8Array([0, 255, 4, 17]));
   await putFile(join(source, 'scripts', 'inspect.sh'), '#!/bin/sh\nexit 97\n', 0o755);
   await mkdir(join(source, 'references', 'empty', 'nested'), { recursive: true });
-  await symlink('scripts/inspect.sh', join(source, 'inspect-link'));
+  await symlink('inspect.sh', join(source, 'scripts', 'inspect-link'));
+  await symlink('scripts/inspect-link', join(source, 'inspect-link'));
   const before = await snapshotPath(sandbox.root);
   const inventory = await inventoryFor();
   const selected = skill(inventory, 'whole-tree', source);
@@ -94,10 +95,20 @@ it('plans complete copy trees with binary assets, empty directories, executable 
   expect(operations.some(operation => operation.kind === 'write' && operation.path.endsWith('/scripts/inspect.sh') && operation.mode === 0o755)).toBe(true);
   const binary = operations.find(operation => operation.kind === 'write' && operation.path.endsWith('/assets/bytes.bin'));
   expect(binary?.kind === 'write' && binary.content.kind === 'source' && binary.content.snapshot.kind === 'file').toBe(true);
-  expect(operations.some(operation => operation.kind === 'symlink' && operation.path.endsWith('/inspect-link') && operation.target === 'scripts/inspect.sh')).toBe(true);
+  const nestedLink = operations.find(operation => operation.kind === 'symlink' && operation.path.endsWith('/scripts/inspect-link'));
+  const outerLink = operations.find(operation => operation.kind === 'symlink' && operation.path.endsWith('/inspect-link'));
+  expect(nestedLink?.kind === 'symlink' && nestedLink.target === 'inspect.sh').toBe(true);
+  expect(outerLink?.kind === 'symlink' && outerLink.target === 'scripts/inspect-link').toBe(true);
+  expect(operations.indexOf(nestedLink!) < operations.indexOf(outerLink!)).toBe(true);
   expect(operations.some(operation => operation.kind === 'write' && operation.path.endsWith('/SKILL.md'))).toBe(true);
   expect(plan.summary.skillMode).toBe('copy');
   expect(await snapshotMatches(before)).toBe(true);
+  const applied = await applyPlan(plan, { confirmed: true });
+  expect(applied.status).toBe('applied');
+  const target = join(sandbox.context.homeDir, '.agents', 'skills', 'whole-tree');
+  expect((await stat(join(target, 'scripts', 'inspect.sh'))).mode & 0o777).toBe(0o755);
+  expect(await readFile(join(target, 'assets', 'bytes.bin'))).toEqual(Buffer.from([0, 255, 4, 17]));
+  expect(await readlink(join(target, 'inspect-link'))).toBe('scripts/inspect-link');
 });
 
 it('plans links only when relevant and avoids a redundant link for an authority already discovered by the destination', async () => {
@@ -428,6 +439,40 @@ it('applies skill copies through safe parent symlinks and bootstraps absent XDG 
   expect((await stat(join(sandbox.context.configHome, 'mishmash'))).mode & 0o777).toBe(0o700);
   expect((await stat(sandbox.context.stateHome)).mode & 0o777).toBe(0o700);
   expect((await stat(join(sandbox.context.stateHome, 'mishmash'))).mode & 0o777).toBe(0o700);
+  expect((await snapshotPath(paths.preferencePath)).kind).toBe('file');
+  expect((await snapshotPath(paths.ownershipPath)).kind).toBe('file');
+});
+
+it('applies OpenCode user skills and private preferences under absent XDG roots with mode 0700', async () => {
+  sandbox = await createSandbox();
+  const sourceRoot = join(sandbox.context.projectRoot, '.claude', 'skills');
+  const source = await putSkill(sourceRoot, 'xdg-private', 'Private user placement');
+  await rm(sandbox.context.configHome, { recursive: true, force: true });
+  await rm(sandbox.context.stateHome, { recursive: true, force: true });
+  const inventory = await inventoryFor();
+  const selected = skill(inventory, 'xdg-private', source);
+  const state = await readState(sandbox.context, 'private-project');
+  const paths = await getStatePaths(sandbox.context, 'private-project');
+  const plan = await planSync(sandbox.context, inventory,
+    request([selected.id], [{ agentId: 'opencode', placement: 'user' }]), state);
+  expect(plan.findings.some(finding => finding.severity === 'error')).toBe(false);
+  expect(plan.operations.some(operation => operation.kind === 'mkdir' && operation.path.startsWith(sandbox!.context.stateHome))).toBe(false);
+  const privateDirs = [
+    sandbox.context.configHome,
+    join(sandbox.context.configHome, 'mishmash'),
+    join(sandbox.context.configHome, 'mishmash', 'projects'),
+    join(sandbox.context.configHome, 'opencode'),
+    join(sandbox.context.configHome, 'opencode', 'skills'),
+  ];
+  for (const path of privateDirs) {
+    const operation = plan.operations.find(item => item.kind === 'mkdir' && item.path === path);
+    expect(operation?.kind === 'mkdir' && operation.mode === 0o700).toBe(true);
+  }
+  const result = await applyPlan(plan, { confirmed: true });
+  expect(result.status).toBe('applied');
+  for (const path of privateDirs) expect((await stat(path)).mode & 0o777).toBe(0o700);
+  const target = join(sandbox.context.configHome, 'opencode', 'skills', 'xdg-private');
+  expect((await snapshotPath(target)).kind).toBe('directory');
   expect((await snapshotPath(paths.preferencePath)).kind).toBe('file');
   expect((await snapshotPath(paths.ownershipPath)).kind).toBe('file');
 });

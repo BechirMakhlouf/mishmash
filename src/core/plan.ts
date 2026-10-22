@@ -186,16 +186,38 @@ class PlanBuilder {
 }
 
 function pathDepth(path: string): number { return resolve(path).split(sep).filter(Boolean).length; }
-function orderOperations(operations: readonly Operation[]): Operation[] {
-  return [...operations].sort((a, b) => {
-    if (a.purpose !== b.purpose) return a.purpose === 'resource' ? -1 : 1;
-    const aRemove = a.kind === 'remove';
-    const bRemove = b.kind === 'remove';
-    if (aRemove !== bRemove) return aRemove ? 1 : -1;
-    const depth = pathDepth(a.path) - pathDepth(b.path);
-    if (depth !== 0) return aRemove ? -depth : depth;
-    return a.path.localeCompare(b.path) || a.kind.localeCompare(b.kind);
-  });
+function compareOperations(a: Operation, b: Operation): number {
+  const aRemove = a.kind === 'remove';
+  const bRemove = b.kind === 'remove';
+  if (aRemove !== bRemove) return aRemove ? 1 : -1;
+  const depth = pathDepth(a.path) - pathDepth(b.path);
+  if (depth !== 0) return aRemove ? -depth : depth;
+  return a.path.localeCompare(b.path) || a.kind.localeCompare(b.kind);
+}
+function orderOperations(operations: readonly Operation[], findings: Finding[]): Operation[] {
+  const result: Operation[] = [];
+  for (const purpose of ['resource', 'state'] as const) {
+    const group = operations.filter(operation => operation.purpose === purpose);
+    result.push(...group.filter(operation => operation.kind !== 'symlink').sort(compareOperations));
+    const pending = new Map(group.filter((operation): operation is Extract<Operation, { kind: 'symlink' }> => operation.kind === 'symlink')
+      .map(operation => [resolve(operation.path), operation]));
+    while (pending.size) {
+      const ready = [...pending.entries()].filter(([, operation]) =>
+        !pending.has(resolve(dirname(operation.path), operation.target)))
+        .sort(([a], [b]) => a.localeCompare(b));
+      if (!ready.length) {
+        const path = [...pending.keys()].sort()[0]!;
+        findings.push(issue('SKILL_LINK_CYCLE', 'Planned skill links contain a dependency cycle.', path));
+        result.push(...[...pending.values()].sort((a, b) => a.path.localeCompare(b.path)));
+        break;
+      }
+      for (const [path, operation] of ready) {
+        result.push(operation);
+        pending.delete(path);
+      }
+    }
+  }
+  return result;
 }
 
 async function addDirsForDestination(builder: PlanBuilder, directory: string, boundary: string, expectedByPath: Map<string, PathSnapshot>, resourceIds: readonly string[], purpose: 'resource' | 'state' = 'resource', directoryMode = 0o755): Promise<void> {
@@ -229,6 +251,7 @@ async function skillPlan(
   destinationScope: 'project' | 'user',
   destinationVisibility: 'shared' | 'private',
   roots: readonly string[],
+  directoryMode: number,
   receipts: ReadonlyMap<string, OwnershipReceipt>,
   nextReceipts: Map<string, OwnershipReceipt>,
 ): Promise<void> {
@@ -317,7 +340,7 @@ async function skillPlan(
         return;
       }
       builder.addPrecondition(parentCheck.snapshot);
-      await addDirsForDestination(builder, parent, roots.find(root => isWithin(root, parent)) ?? roots[0]!, new Map([[parent, parentCheck.snapshot]]), [resource.id]);
+      await addDirsForDestination(builder, parent, roots.find(root => isWithin(root, parent)) ?? roots[0]!, new Map([[parent, parentCheck.snapshot]]), [resource.id], 'resource', directoryMode);
       builder.addOperation({ kind: 'symlink', path: target, expected: current, target: desiredLink,
         resourceIds: [resource.id], purpose: 'resource', description: `Link skill ${resource.name} to its authoritative source.` });
       if (receipt) builder.updates++; else builder.additions++;
@@ -346,7 +369,7 @@ async function skillPlan(
         builder.addPrecondition(snapshot);
       }
     }
-    await addDirsForDestination(builder, parent, roots.find(root => isWithin(root, parent)) ?? roots[0]!, expectedByPath, [resource.id]);
+    await addDirsForDestination(builder, parent, roots.find(root => isWithin(root, parent)) ?? roots[0]!, expectedByPath, [resource.id], 'resource', directoryMode);
     for (const entry of desiredEntries) {
       const path = entry.relativePath ? resolve(target, ...entry.relativePath.split('/')) : target;
       const expected = expectedByPath.get(path) ?? current;
@@ -493,6 +516,7 @@ async function prepareMcpDestination(
   adapter: NativeAdapter,
   resources: readonly McpResource[],
   roots: readonly string[],
+  privateConfigRoots: readonly string[],
   receipts: Map<string, OwnershipReceipt>,
   nextReceipts: Map<string, OwnershipReceipt>,
 ): Promise<void> {
@@ -657,8 +681,11 @@ async function prepareMcpDestination(
     }
     builder.addPrecondition(parentCheck.snapshot);
     const boundary = roots.find(root => isWithin(root, parent));
-    if (boundary) await addDirsForDestination(builder, parent, boundary,
-      new Map([[parent, parentCheck.snapshot], [path, expected]]), [...merged.resourceIds].sort());
+    if (boundary) {
+      const directoryMode = destination.placement !== 'project' && privateConfigRoots.some(root => isWithin(root, parent)) ? 0o700 : 0o755;
+      await addDirsForDestination(builder, parent, boundary,
+        new Map([[parent, parentCheck.snapshot], [path, expected]]), [...merged.resourceIds].sort(), 'resource', directoryMode);
+    }
     builder.addOperation({ kind: 'write', path: merged.path, expected, content: { kind: 'bytes', bytes: merged.edit.bytes }, mode: merged.edit.mode,
       resourceIds: [...merged.resourceIds].sort(), purpose: 'resource', description: `Update selected MCP registrations for ${destination.agentId}.` });
   }
@@ -762,9 +789,10 @@ export async function planSync(
             builder.findings.push(issue('UNSAFE_DESTINATION_PATH', 'A skill destination root is unsafe or is not a directory.', location.path));
           } else {
             await addPhysicalPrecondition(builder, directory.snapshot);
+            const directoryMode = destination.placement !== 'project' && configRoots.some(root => isWithin(root, directory.snapshot!.resolvedPath)) ? 0o700 : 0o755;
             for (const resource of selectedSkills) {
               await skillPlan(builder, resource, destination, adapter, skillMode, directory.snapshot.resolvedPath,
-                location.scope, location.visibility, allowedRoots, receiptLookup, nextReceipts);
+                location.scope, location.visibility, allowedRoots, directoryMode, receiptLookup, nextReceipts);
             }
           }
         }
@@ -775,7 +803,7 @@ export async function planSync(
     for (const resource of unsupportedMcp) builder.findings.push(issue('UNSUPPORTED_MCP_PLACEMENT', 'This destination does not support the selected MCP placement.', undefined, resource.id));
     const roots = destination.placement === 'project' ? projectRoots
       : destination.placement === 'user' ? [...homeRoots, ...configRoots] : [...homeRoots, ...configRoots];
-    await prepareMcpDestination(builder, context, destination, adapter, selectedMcp, roots, receiptLookup, nextReceipts);
+    await prepareMcpDestination(builder, context, destination, adapter, selectedMcp, roots, configRoots, receiptLookup, nextReceipts);
   }
 
   const choiceConfig = canonicalChoices(authority.choices);
@@ -842,7 +870,7 @@ export async function planSync(
     }
   }
 
-  const operations = orderOperations(builder.operations);
+  const operations = orderOperations(builder.operations, builder.findings);
   const preconditions = uniqueSnapshots(builder.preconditions, builder.findings);
   const summary: PlanSummary = {
     authorities: [...new Map(selected.map(resource => [resource.source.id, resource.source])).values()].sort((a, b) => a.id.localeCompare(b.id)),

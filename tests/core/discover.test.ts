@@ -1,5 +1,5 @@
 import { afterEach, expect, it } from 'vitest';
-import { mkdir, readFile } from 'node:fs/promises';
+import { mkdir, readFile, symlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { discover } from '../../src/core/discover.js';
 import { snapshotMatches, snapshotPath } from '../../src/fs/snapshot.js';
@@ -72,6 +72,29 @@ it('does not treat an existing shared skill directory as native agent detection'
   expect(inventory.detectedAgents).toEqual([]);
   expect(inventory.resources.filter(resource => resource.kind === 'skill' && resource.name === 'shared-only')).toHaveLength(1);
   expect(inventory.resources.find(resource => resource.kind === 'skill' && resource.name === 'shared-only')?.path).toBe(path);
+  expect(await snapshotMatches(before)).toBe(true);
+});
+
+it('coalesces identical OpenCode MCP documents reached through physical aliases', async () => {
+  sandbox = await createSandbox();
+  const physicalPath = join(sandbox.context.projectRoot, 'opencode.json');
+  const alias = join(sandbox.context.projectRoot, '.opencode', 'opencode.json');
+  await putFile(physicalPath, JSON.stringify({ mcp: { shared: { type: 'local', command: ['never-run'] } } }));
+  await mkdir(join(sandbox.context.projectRoot, '.opencode'), { recursive: true });
+  await symlink(physicalPath, alias);
+  const before = await snapshotPath(sandbox.root);
+  const inventory = await discover(sandbox.context);
+  const variants = inventory.resources.filter(resource => resource.kind === 'mcp'
+    && resource.name === 'shared' && resource.definition.nativeAgent === 'opencode');
+  expect(variants).toHaveLength(1);
+  const variant = variants[0];
+  if (!variant || variant.kind !== 'mcp') throw new Error('Expected one OpenCode MCP resource');
+  expect(variant.definition.nativeAgent).toBe('opencode');
+  expect(variant.path).toBe(physicalPath);
+  expect(variant.snapshot.path).toBe(physicalPath);
+  expect(inventory.findings.some(finding => finding.code === 'INCONSISTENT_RESOURCE_SNAPSHOT')).toBe(false);
+  expect(inventory.checkedLocations.some(location => location.path === physicalPath && location.exists)).toBe(true);
+  expect(inventory.checkedLocations.some(location => location.path === alias && location.exists)).toBe(true);
   expect(await snapshotMatches(before)).toBe(true);
 });
 

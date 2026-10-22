@@ -3,7 +3,7 @@ import { resolve } from 'node:path';
 import { nativeAdapters } from '../agents/index.js';
 import type { NativeAdapter } from '../agents/contract.js';
 import type { AgentId, CheckedLocation, Context, Finding, Inventory, ResourceInstance, SourceRef } from '../model.js';
-import { errorCode, filesystemFinding, fingerprintValue, snapshotsEqual } from '../fs/snapshot.js';
+import { errorCode, filesystemFinding, fingerprintValue, snapshotPath } from '../fs/snapshot.js';
 import { discoverSkills, resourceId, sourceRef } from '../resources/skills.js';
 
 function sortedUnique(values: readonly AgentId[]): AgentId[] {
@@ -40,6 +40,11 @@ function resourceSemantics(resource: ResourceInstance): string {
   return fingerprintValue(resource.kind === 'mcp'
     ? [resource.name, resource.description ?? null, resource.locator, resource.definition]
     : [resource.name, resource.description ?? null, resource.locator]);
+}
+function sameSnapshotContents(a: ResourceInstance['snapshot'], b: ResourceInstance['snapshot']): boolean {
+  return a.kind === b.kind && a.mode === b.mode && a.digest === b.digest
+    && resolve(a.resolvedPath) === resolve(b.resolvedPath)
+    && fingerprintValue(a.entries) === fingerprintValue(b.entries);
 }
 
 function sortFindings(findings: readonly Finding[]): Finding[] {
@@ -109,8 +114,14 @@ export async function discover(context: Context, adapters: readonly NativeAdapte
         const id = resource.kind === 'mcp'
           ? resourceId(source, JSON.stringify([resource.locator, resource.definition.nativeAgent]))
           : resourceId(source, resource.locator);
+        const snapshot = resource.snapshot.kind === 'symlink'
+          ? resource.snapshot : await snapshotPath(resource.snapshot.resolvedPath);
+        if (!sameSnapshotContents(resource.snapshot, snapshot)) {
+          findings.push(filesystemFinding(resource.path, 'SOURCE_CHANGED'));
+          continue;
+        }
         rawSources.push(source);
-        rawResources.push({ ...resource, id, source });
+        rawResources.push({ ...resource, id, path: snapshot.kind === 'symlink' ? resource.path : snapshot.path, snapshot, source });
       } catch { findings.push(filesystemFinding(resource.path, 'SOURCE_CHANGED')); }
     }
   }
@@ -151,7 +162,7 @@ export async function discover(context: Context, adapters: readonly NativeAdapte
   const resources: ResourceInstance[] = [];
   for (const [id, group] of byId) {
     const representative = [...group].sort((a, b) => resourceSemantics(a).localeCompare(resourceSemantics(b)))[0]!;
-    const inconsistent = group.some(resource => !snapshotsEqual(resource.snapshot, representative.snapshot)
+    const inconsistent = group.some(resource => !sameSnapshotContents(resource.snapshot, representative.snapshot)
       || resourceSemantics(resource) !== resourceSemantics(representative));
     if (inconsistent) findings.push({ severity: 'error', code: 'INCONSISTENT_RESOURCE_SNAPSHOT',
       resourceId: id, path: representative.path,
