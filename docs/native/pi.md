@@ -43,4 +43,6 @@ A same-Pi selected entry preserves the complete native object, including unknown
 
 Each target uses the native key path `['mcpServers', name]`. Its slot ID is `fingerprintValue([physicalConfigPath, 'mcp', JSON.stringify(nativePath)])`; before/after fingerprints cover that exact native server entry. The complete file snapshot is separately returned for stale-plan checks. Ownership/collision policy and actual writes belong to the planner/transaction engine. All diagnostics are static and location-oriented: no configuration excerpts, arguments, environment values, credential headers, authentication flows, subprocesses, MCP connections, or source writes occur here.
 
+Prepared target paths retain the configured native config alias, including when the selected entry is unchanged and no file edit is returned. This lets the planner snapshot linked `.pi` parents for stale-plan checks. Slot IDs still use the physical configuration path, and discovered resource sources remain canonical physical locations.
+
 Behavioral coverage lives in `tests/agents/pi.test.ts` and uses disposable real project/home/XDG directories.
