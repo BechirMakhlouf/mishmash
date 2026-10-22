@@ -1,4 +1,4 @@
-import { readFile, realpath } from 'node:fs/promises';
+import { lstat, readFile, realpath } from 'node:fs/promises';
 import { basename, dirname, isAbsolute, relative, resolve, sep } from 'node:path';
 import type { NativeAdapter, PreparedFileEdit, PreparedMcpTarget } from '../agents/contract.js';
 import { nativeAdapters } from '../agents/index.js';
@@ -44,6 +44,24 @@ function uniqueSnapshots(snapshots: readonly PathSnapshot[], findings: Finding[]
   return [...byPath.values()].sort((a, b) => a.path.localeCompare(b.path));
 }
 async function realRoot(path: string): Promise<string> { return resolve(await realpath(path)); }
+async function projectedRoot(path: string): Promise<string> {
+  const suffix: string[] = [];
+  let current = resolve(path);
+  for (;;) {
+    try { return resolve(await realpath(current), ...suffix); }
+    catch (error) {
+      if (errorCode(error) !== 'ENOENT' && errorCode(error) !== 'ENOTDIR') throw error;
+      let exists = false;
+      try { await lstat(current); exists = true; }
+      catch (statError) { if (errorCode(statError) !== 'ENOENT') throw statError; }
+      if (exists) throw new Error('An existing approved root could not be resolved safely.');
+      const parent = dirname(current);
+      if (parent === current) throw error;
+      suffix.unshift(basename(current));
+      current = parent;
+    }
+  }
+}
 
 async function resolvedParent(path: string): Promise<string> {
   const suffix: string[] = [];
@@ -77,21 +95,29 @@ async function inspectScopedPath(path: string, roots: readonly string[], allowFi
 
 function skillSlot(path: string): string { return fingerprintValue([resolve(path), 'skill']); }
 function skillFingerprint(snapshot: PathSnapshot): string {
-  return snapshot.kind === 'symlink' ? fingerprintValue(['symlink', snapshot.linkTarget ?? '']) : snapshot.digest;
+  return snapshot.kind === 'symlink'
+    ? fingerprintValue(['symlink', snapshot.linkTarget ?? '', resolve(snapshot.resolvedPath)]) : snapshot.digest;
 }
-function relativeLinkTarget(from: string, to: string): string {
-  return relative(dirname(from), to) || basename(to);
+function relativeLinkTarget(parent: string, to: string): string {
+  return relative(parent, to) || basename(to);
+}
+async function physicalEntryPath(path: string, snapshot: PathSnapshot): Promise<string> {
+  return snapshot.kind === 'symlink' ? resolve(await resolvedParent(path), basename(path)) : resolve(snapshot.resolvedPath);
 }
 function invalidSkillName(name: string): boolean {
   return !name.trim() || name === '.' || name === '..' || isAbsolute(name) || name.includes('/') || name.includes('\\') || name.includes('\0');
 }
-function sourceAgentSet(source: SourceRef): ReadonlySet<string> {
-  return new Set([source.agentId, ...(source.agents ?? [])]);
+function operationKey(operation: Operation): string {
+  return operation.expected.kind === 'symlink' ? resolve(operation.path) : resolve(operation.expected.resolvedPath);
 }
-function operationKey(operation: Operation): string { return `${operation.purpose}\0${resolve(operation.path)}`; }
 function operationComparable(operation: Operation): unknown {
   const { resourceIds: _resourceIds, description: _description, ...rest } = operation;
   return rest;
+}
+function sameMkdirIntent(first: Operation, second: Operation): boolean {
+  return first.kind === 'mkdir' && second.kind === 'mkdir' && first.mode === second.mode
+    && first.expected.kind === 'missing' && second.expected.kind === 'missing'
+    && resolve(first.expected.resolvedPath) === resolve(second.expected.resolvedPath);
 }
 
 class PlanBuilder {
@@ -114,12 +140,15 @@ class PlanBuilder {
     const key = operationKey(normalized);
     const existing = this.operations.find(item => operationKey(item) === key);
     if (existing) {
-      if (fingerprintValue(operationComparable(existing)) !== fingerprintValue(operationComparable(normalized))) {
+      const identical = fingerprintValue(operationComparable(existing)) === fingerprintValue(operationComparable(normalized));
+      const sharedDirectory = sameMkdirIntent(existing, normalized);
+      if (!identical && !sharedDirectory) {
         this.findings.push(issue('DESTINATION_SLOT_CONFLICT', 'Selected resources require incompatible writes to the same destination.', path));
       } else {
         const resourceIds = [...new Set([...existing.resourceIds, ...normalized.resourceIds])].sort();
+        const purpose = existing.purpose === 'resource' || normalized.purpose === 'resource' ? 'resource' : 'state';
         const index = this.operations.indexOf(existing);
-        this.operations[index] = { ...existing, resourceIds };
+        this.operations[index] = { ...existing, resourceIds, purpose } as Operation;
       }
       return;
     }
@@ -151,12 +180,13 @@ async function addDirsForDestination(builder: PlanBuilder, directory: string, bo
   const missing: { path: string; snapshot: PathSnapshot }[] = [];
   let current = resolve(directory);
   const root = resolve(boundary);
-  while (isWithin(root, current) && current !== root) {
+  while (isWithin(root, current)) {
     const snapshot = expectedByPath.get(current) ?? await snapshotPath(current);
     builder.addPrecondition(snapshot);
     if (snapshot.kind === 'directory') break;
     if (snapshot.kind !== 'missing') break;
     missing.push({ path: current, snapshot });
+    if (current === root) break;
     const parent = dirname(current);
     if (parent === current) break;
     current = parent;
@@ -174,14 +204,23 @@ async function skillPlan(
   adapter: NativeAdapter,
   mode: 'copy' | 'link',
   destinationRoot: string,
+  destinationScope: 'project' | 'user',
+  destinationVisibility: 'shared' | 'private',
   roots: readonly string[],
   receipts: ReadonlyMap<string, OwnershipReceipt>,
   nextReceipts: Map<string, OwnershipReceipt>,
 ): Promise<void> {
-  if (invalidSkillName(resource.name)) {
-    builder.findings.push(issue('INVALID_SKILL_NAME', 'A selected skill name cannot be used as a safe destination directory.', resource.path, resource.id));
+  const directoryName = basename(resource.path);
+  if (invalidSkillName(directoryName)) {
+    builder.findings.push(issue('INVALID_SKILL_NAME', 'A selected skill directory cannot be used as a safe destination name.', resource.path, resource.id));
     return;
   }
+  if (resource.name !== directoryName) {
+    builder.findings.push(issue('SKILL_NAME_DIRECTORY_MISMATCH', 'A skill metadata name must match its native directory name.', resource.path, resource.id,
+      'Correct the SKILL.md name to match this directory, then rediscover.'));
+    return;
+  }
+
 
   if (resource.source.visibility === 'private' && (destination.placement === 'project' || destination.placement === 'user')
     && !(resource.source.scope === 'user' && destination.placement === 'user')) {
@@ -197,7 +236,7 @@ async function skillPlan(
     return;
   }
   builder.addPrecondition(resource.snapshot);
-  const target = resolve(destinationRoot, resource.name);
+  const target = resolve(destinationRoot, directoryName);
   const checked = await inspectScopedPath(target, roots, true);
   if (!checked.safe || !checked.snapshot) {
     builder.findings.push(issue('UNSAFE_DESTINATION_PATH', 'A skill destination escapes its approved scope or crosses an unsafe parent.', target, resource.id));
@@ -205,24 +244,27 @@ async function skillPlan(
   }
   const current = checked.snapshot;
   builder.addPrecondition(current);
-  const slotId = skillSlot(target);
+  const slotPath = await physicalEntryPath(target, current);
+  const slotId = skillSlot(slotPath);
   const receipt = receipts.get(slotId);
-  const desiredLink = relativeLinkTarget(target, resource.path);
-  const desiredFingerprint = mode === 'link' ? fingerprintValue(['symlink', desiredLink]) : resource.snapshot.digest;
+  const desiredLink = relativeLinkTarget(await resolvedParent(target), resource.path);
+  const desiredFingerprint = mode === 'link'
+    ? fingerprintValue(['symlink', desiredLink, resolve(resource.path)]) : resource.snapshot.digest;
 
-  if (resourceAgentDiscovered(resource, destination.agentId)) {
+
+  if (await sameDiscoveredRoot(resource, destinationRoot, destinationScope, destinationVisibility)) {
     builder.destination(destination, target);
     builder.unchanged++;
     return;
   }
   if (receipt) {
-    if (receipt.kind !== 'skill' || resolve(receipt.path) !== target || skillFingerprint(current) !== receipt.fingerprint) {
+    if (receipt.kind !== 'skill' || resolve(receipt.path) !== slotPath || receipt.key !== directoryName || skillFingerprint(current) !== receipt.fingerprint) {
       builder.findings.push(issue('OWNED_OUTPUT_DRIFT', 'A selected managed skill destination changed since its last receipt.', target, resource.id));
       return;
     }
   } else if (current.kind !== 'missing') {
     const identical = mode === 'copy' ? current.kind === 'directory' && current.digest === desiredFingerprint
-      : current.kind === 'symlink' && current.linkTarget === desiredLink;
+      : current.kind === 'symlink' && current.linkTarget === desiredLink && resolve(current.resolvedPath) === resolve(resource.path);
     builder.destination(destination, target);
     if (identical) { builder.unchanged++; return; }
     builder.findings.push(issue('UNMANAGED_DESTINATION_COLLISION', 'A different unmanaged skill already occupies the selected destination.', target, resource.id));
@@ -232,7 +274,7 @@ async function skillPlan(
   builder.destination(destination, target);
   if (receipt || current.kind === 'missing') {
     nextReceipts.set(slotId, {
-      slotId, path: target, kind: 'skill', key: resource.name, sourceId: resource.source.id,
+      slotId, path: slotPath, kind: 'skill', key: directoryName, sourceId: resource.source.id,
       resourceId: resource.id, fingerprint: desiredFingerprint,
     });
   }
@@ -242,7 +284,7 @@ async function skillPlan(
   }
   const desiredEntries = resource.snapshot.entries;
   if (mode === 'link') {
-    if (current.kind === 'symlink' && current.linkTarget === desiredLink) {
+    if (current.kind === 'symlink' && skillFingerprint(current) === desiredFingerprint) {
       if (receipt) builder.unchanged++;
       else builder.unchanged++;
     } else {
@@ -383,8 +425,15 @@ async function skillPlan(
 function sourcePathForEntry(root: string, entry: TreeEntry): string {
   return entry.relativePath ? resolve(root, ...entry.relativePath.split('/')) : root;
 }
-function resourceAgentDiscovered(resource: ResourceInstance, agentId: string): boolean {
-  return sourceAgentSet(resource.source).has(agentId);
+async function sameDiscoveredRoot(
+  resource: SkillResource,
+  destinationRoot: string,
+  destinationScope: 'project' | 'user',
+  destinationVisibility: 'shared' | 'private',
+): Promise<boolean> {
+  if (resource.source.scope !== destinationScope || resource.source.visibility !== destinationVisibility) return false;
+  try { return resolve(await realpath(resource.source.path)) === resolve(await realpath(destinationRoot)); }
+  catch { return false; }
 }
 
 function selectedChoiceMap(request: SyncRequest, resources: readonly ResourceInstance[]): Record<string, string> {
@@ -413,7 +462,7 @@ function privacyAllowed(resource: ResourceInstance, placement: DestinationReques
   return placement === 'user' || placement === 'private-project';
 }
 
-interface MergedPreparedFile { edit: PreparedFileEdit; resourceIds: Set<string>; blocked: boolean }
+interface MergedPreparedFile { edit: PreparedFileEdit; path: string; expected: PathSnapshot; resourceIds: Set<string>; blocked: boolean }
 
 async function prepareMcpDestination(
   builder: PlanBuilder,
@@ -445,97 +494,126 @@ async function prepareMcpDestination(
     if (group) group.push(target); else targetsBySlot.set(target.slotId, [target]);
   }
   const validTargets = new Set<string>();
+  const targetPhysicalPaths = new Map<string, string>();
   for (const [slotId, targets] of targetsBySlot) {
     const first = targets[0]!;
     const expectedFingerprint = first.afterFingerprint;
-    if (targets.some(target => target.afterFingerprint !== expectedFingerprint || target.path !== first.path || target.key !== first.key)) {
+    if (targets.some(target => target.afterFingerprint !== expectedFingerprint || target.key !== first.key)) {
       builder.findings.push(issue('MCP_DESTINATION_SLOT_CONFLICT', 'Selected MCP definitions require incompatible values in the same native destination slot.', first.path));
-      blockedPaths.add(resolve(first.path));
       continue;
     }
     const selectedResources = targets.map(target => resources.find(resource => resource.id === target.resourceId)).filter((item): item is McpResource => item !== undefined);
     if (selectedResources.length !== targets.length) {
       builder.findings.push(issue('INVALID_MCP_TARGET', 'A native adapter returned a target for an unselected MCP definition.', first.path));
-      blockedPaths.add(resolve(first.path));
       continue;
     }
     const file = await inspectScopedPath(first.path, roots);
     if (!file.safe || !file.snapshot) {
       builder.findings.push(issue('UNSAFE_DESTINATION_PATH', 'An MCP configuration destination escapes its approved scope or crosses an unsafe parent.', first.path));
-      blockedPaths.add(resolve(first.path));
+      continue;
+    }
+    if (file.snapshot.kind !== 'missing' && file.snapshot.kind !== 'file') {
+      builder.findings.push(issue('UNSAFE_DESTINATION_TYPE', 'An MCP configuration destination is not a regular file.', first.path));
+      continue;
+    }
+    const physicalPath = await physicalEntryPath(first.path, file.snapshot);
+    let aliasesMatch = true;
+    for (const target of targets.slice(1)) {
+      const alias = await inspectScopedPath(target.path, roots);
+      if (!alias.safe || !alias.snapshot || alias.snapshot.kind !== file.snapshot.kind
+        || alias.snapshot.digest !== file.snapshot.digest || alias.snapshot.mode !== file.snapshot.mode
+        || resolve(alias.snapshot.resolvedPath) !== physicalPath) {
+        aliasesMatch = false;
+        break;
+      }
+      builder.addPrecondition(alias.snapshot);
+    }
+    if (!aliasesMatch) {
+      builder.findings.push(issue('MCP_DESTINATION_SLOT_CONFLICT', 'The same physical MCP slot has inconsistent native file snapshots.', first.path));
       continue;
     }
     builder.addPrecondition(file.snapshot);
-    if (file.snapshot.kind !== 'missing' && file.snapshot.kind !== 'file') {
-      builder.findings.push(issue('UNSAFE_DESTINATION_TYPE', 'An MCP configuration destination is not a regular file.', first.path));
-      blockedPaths.add(resolve(first.path));
-      continue;
-    }
+    targetPhysicalPaths.set(slotId, physicalPath);
     const receipt = receipts.get(slotId);
-    if (receipt && (receipt.kind !== 'mcp' || resolve(receipt.path) !== resolve(first.path) || receipt.key !== first.key)) {
+    if (receipt && (receipt.kind !== 'mcp' || resolve(receipt.path) !== physicalPath || receipt.key !== first.key)) {
       builder.findings.push(issue('OWNERSHIP_RECEIPT_CONFLICT', 'An MCP destination receipt does not match the selected native slot.', first.path));
-      blockedPaths.add(resolve(first.path));
+      blockedPaths.add(physicalPath);
       continue;
     }
     const before = first.beforeFingerprint;
     if (targets.some(target => target.beforeFingerprint !== before)) {
       builder.findings.push(issue('MCP_DESTINATION_SLOT_CONFLICT', 'The same MCP destination slot has inconsistent current values.', first.path));
-      blockedPaths.add(resolve(first.path));
+      blockedPaths.add(physicalPath);
       continue;
     }
     if (receipt && before !== receipt.fingerprint) {
       builder.findings.push(issue('OWNED_MCP_DRIFT', 'A selected managed MCP registration changed since its last receipt.', first.path, selectedResources[0]?.id));
-      blockedPaths.add(resolve(first.path));
+      blockedPaths.add(physicalPath);
       continue;
     }
     if (!receipt && before !== undefined && before !== expectedFingerprint) {
       builder.findings.push(issue('UNMANAGED_MCP_COLLISION', 'A different unmanaged MCP registration already occupies the selected native slot.', first.path, selectedResources[0]?.id));
-      blockedPaths.add(resolve(first.path));
+      blockedPaths.add(physicalPath);
       continue;
     }
     validTargets.add(slotId);
     const chosen = selectedResources[0]!;
     if (receipt || before === undefined || before !== expectedFingerprint) {
       nextReceipts.set(slotId, {
-        slotId, path: resolve(first.path), kind: 'mcp', key: first.key, sourceId: chosen.source.id,
+        slotId, path: physicalPath, kind: 'mcp', key: first.key, sourceId: chosen.source.id,
         resourceId: chosen.id, fingerprint: expectedFingerprint,
       });
     }
     if (before === expectedFingerprint) builder.unchanged++;
     else if (before === undefined) builder.additions++;
     else builder.updates++;
-    builder.destination(destination, first.path);
+    builder.destination(destination, physicalPath);
   }
 
   const filesByPath = new Map<string, MergedPreparedFile>();
   for (const edit of prepared.files) {
-    const path = resolve(edit.path);
-    const associated = prepared.targets.filter(target => resolve(target.path) === path);
+    const aliasPath = resolve(edit.path);
+    const path = resolve(edit.expected.resolvedPath);
+    const associated = prepared.targets.filter(target => targetPhysicalPaths.get(target.slotId) === path || resolve(target.path) === aliasPath);
     const resourceIds = new Set(associated.map(target => target.resourceId));
-    const unsafe = !roots.some(root => isWithin(root, path)) || !await snapshotMatches(edit.expected)
-      || edit.expected.path !== path || edit.expected.kind !== 'missing' && edit.expected.kind !== 'file';
-    if (unsafe) {
-      builder.findings.push(issue('STALE_OR_UNSAFE_MCP_EDIT', 'A prepared MCP edit is stale or outside the approved destination scope.', path));
+    const alias = await inspectScopedPath(aliasPath, roots);
+    const physical = await inspectScopedPath(path, roots);
+    const expected = physical.snapshot;
+    const unsafe = !await snapshotMatches(edit.expected) || edit.expected.path !== aliasPath
+      || (edit.expected.kind !== 'missing' && edit.expected.kind !== 'file')
+      || !alias.safe || !alias.snapshot || !physical.safe || !expected
+      || expected.kind !== edit.expected.kind || expected.digest !== edit.expected.digest
+      || expected.mode !== edit.expected.mode || resolve(expected.resolvedPath) !== path;
+    if (unsafe || !expected || !alias.snapshot) {
+      builder.findings.push(issue('STALE_OR_UNSAFE_MCP_EDIT', 'A prepared MCP edit is stale or outside the approved destination scope.', aliasPath));
+      blockedPaths.add(path);
+      continue;
+    }
+    builder.addPrecondition(alias.snapshot);
+    builder.addPrecondition(edit.expected);
+    builder.addPrecondition(expected);
+    if (!associated.length) {
+      builder.findings.push(issue('UNSCOPED_MCP_EDIT', 'A native adapter prepared a file edit without a selected registration target.', aliasPath));
       blockedPaths.add(path);
       continue;
     }
     if (associated.some(target => !validTargets.has(target.slotId))) blockedPaths.add(path);
     const previous = filesByPath.get(path);
     if (previous) {
-      if (!snapshotsEqual(previous.edit.expected, edit.expected) || !sameBytes(previous.edit.bytes, edit.bytes)) {
-        builder.findings.push(issue('MCP_FILE_EDIT_CONFLICT', 'Native adapters prepared incompatible edits for the same configuration file.', path));
+      if (!snapshotsEqual(previous.expected, expected) || !sameBytes(previous.edit.bytes, edit.bytes)) {
+        builder.findings.push(issue('MCP_FILE_EDIT_CONFLICT', 'Native adapters prepared incompatible edits for the same physical configuration file.', path));
         previous.blocked = true;
         blockedPaths.add(path);
       } else {
         for (const id of resourceIds) previous.resourceIds.add(id);
       }
-    } else filesByPath.set(path, { edit, resourceIds, blocked: false });
+    } else filesByPath.set(path, { edit, path, expected, resourceIds, blocked: false });
   }
   for (const [path, merged] of filesByPath) {
     if (merged.blocked || blockedPaths.has(path)) continue;
-    const expected = merged.edit.expected;
+    const expected = merged.expected;
     builder.addPrecondition(expected);
-    builder.destination(destination, path);
+    builder.destination(destination, merged.path);
     if (expected.kind === 'file') {
       try {
         if (sameBytes(await readFile(path), merged.edit.bytes)) continue;
@@ -554,7 +632,7 @@ async function prepareMcpDestination(
     const boundary = roots.find(root => isWithin(root, parent));
     if (boundary) await addDirsForDestination(builder, parent, boundary,
       new Map([[parent, parentCheck.snapshot], [path, expected]]), [...merged.resourceIds].sort());
-    builder.addOperation({ kind: 'write', path, expected, content: { kind: 'bytes', bytes: merged.edit.bytes }, mode: merged.edit.mode,
+    builder.addOperation({ kind: 'write', path: merged.path, expected, content: { kind: 'bytes', bytes: merged.edit.bytes }, mode: merged.edit.mode,
       resourceIds: [...merged.resourceIds].sort(), purpose: 'resource', description: `Update selected MCP registrations for ${destination.agentId}.` });
   }
 }
@@ -597,14 +675,30 @@ export async function planSync(
   let homeRoot: string;
   let configRoot: string;
   let stateRoot: string;
-  try {
-    [projectRoot, homeRoot, configRoot, stateRoot] = await Promise.all([
-      realRoot(context.projectRoot), realRoot(context.homeDir), realRoot(context.configHome), realRoot(context.stateHome),
-    ]);
-  } catch {
-    builder.findings.push(issue('INVALID_CONTEXT_ROOT', 'An approved project or private context root could not be resolved safely.'));
-    projectRoot = resolve(context.projectRoot); homeRoot = resolve(context.homeDir); configRoot = resolve(context.configHome); stateRoot = resolve(context.stateHome);
+  try { projectRoot = await realRoot(context.projectRoot); }
+  catch {
+    builder.findings.push(issue('INVALID_CONTEXT_ROOT', 'The approved project root could not be resolved safely.'));
+    projectRoot = resolve(context.projectRoot);
   }
+  try { homeRoot = await realRoot(context.homeDir); }
+  catch {
+    builder.findings.push(issue('INVALID_CONTEXT_ROOT', 'The approved home root could not be resolved safely.'));
+    homeRoot = resolve(context.homeDir);
+  }
+  try { configRoot = await projectedRoot(context.configHome); }
+  catch {
+    builder.findings.push(issue('UNSAFE_STATE_ROOT', 'The approved configuration root could not be resolved safely.'));
+    configRoot = resolve(context.configHome);
+  }
+  try { stateRoot = await projectedRoot(context.stateHome); }
+  catch {
+    builder.findings.push(issue('UNSAFE_STATE_ROOT', 'The approved state root could not be resolved safely.'));
+    stateRoot = resolve(context.stateHome);
+  }
+  const projectRoots = [...new Set([resolve(context.projectRoot), projectRoot])];
+  const homeRoots = [...new Set([resolve(context.homeDir), homeRoot])];
+  const configRoots = [...new Set([resolve(context.configHome), configRoot])];
+  const stateRoots = [...new Set([resolve(context.stateHome), stateRoot])];
   const skillResources = selectedGroup(selected, 'skill') as SkillResource[];
   const mcpResources = selectedGroup(selected, 'mcp') as McpResource[];
   if (skillResources.length && approvedRequest.skillMode !== 'copy' && approvedRequest.skillMode !== 'link') {
@@ -630,8 +724,8 @@ export async function planSync(
         if (!resolved.findings.length) builder.findings.push(issue('UNRESOLVED_SKILL_DESTINATION', 'The adapter did not resolve a supported skill destination.'));
       } else {
         const location = resolved.location;
-        const allowedRoots = destination.placement === 'project' ? [projectRoot]
-          : destination.placement === 'user' ? [homeRoot, configRoot] : [homeRoot, configRoot];
+        const allowedRoots = destination.placement === 'project' ? projectRoots
+          : destination.placement === 'user' ? [...homeRoots, ...configRoots] : [...homeRoots, ...configRoots];
         if (location.scope !== (destination.placement === 'user' ? 'user' : 'project')
           || location.visibility !== (destination.placement === 'project' ? 'shared' : 'private')) {
           builder.findings.push(issue('DESTINATION_SCOPE_MISMATCH', 'The adapter destination scope does not match the approved placement.', location.path));
@@ -642,7 +736,8 @@ export async function planSync(
           } else {
             builder.addPrecondition(directory.snapshot);
             for (const resource of selectedSkills) {
-              await skillPlan(builder, resource, destination, adapter, skillMode, location.path, allowedRoots, receiptLookup, nextReceipts);
+              await skillPlan(builder, resource, destination, adapter, skillMode, directory.snapshot.resolvedPath,
+                location.scope, location.visibility, allowedRoots, receiptLookup, nextReceipts);
             }
           }
         }
@@ -651,16 +746,25 @@ export async function planSync(
     const selectedMcp = mcpResources.filter(resource => adapter.capabilities.mcp.includes(destination.placement));
     const unsupportedMcp = mcpResources.filter(resource => !adapter.capabilities.mcp.includes(destination.placement));
     for (const resource of unsupportedMcp) builder.findings.push(issue('UNSUPPORTED_MCP_PLACEMENT', 'This destination does not support the selected MCP placement.', undefined, resource.id));
-    const roots = destination.placement === 'project' ? [projectRoot]
-      : destination.placement === 'user' ? [homeRoot, configRoot] : [homeRoot, configRoot];
+    const roots = destination.placement === 'project' ? projectRoots
+      : destination.placement === 'user' ? [...homeRoots, ...configRoots] : [...homeRoots, ...configRoots];
     await prepareMcpDestination(builder, context, destination, adapter, selectedMcp, roots, receiptLookup, nextReceipts);
   }
 
   const choiceConfig = canonicalChoices(authority.choices);
+  const privateProjectMetadataBlocked = approvedRequest.configuration === 'project' && (
+    selected.some(resource => resource.source.visibility === 'private')
+    || choiceConfig.sources.some(source => source.visibility === 'private')
+    || Object.entries(choiceConfig.resourceAuthorities).some(([key, id]) => inventory.resources.some(resource =>
+      resource.id === id && `${resource.kind}:${resource.name}` === key && resource.source.visibility === 'private'))
+  );
+  if (privateProjectMetadataBlocked) builder.findings.push(issue('PRIVATE_AUTHORITY_SHARED_STORAGE',
+    'Private source locations cannot be persisted in shared project preferences.', undefined, undefined,
+    'Choose user or private-project configuration storage for private source authority.'));
   let statePaths: Awaited<ReturnType<typeof getStatePaths>> | undefined;
   try { statePaths = await getStatePaths(context, approvedRequest.configuration); }
   catch { builder.findings.push(issue('UNSAFE_STATE_PATH', 'The approved state location could not be resolved safely.')); }
-  if (statePaths) {
+  if (statePaths && !privateProjectMetadataBlocked) {
     const expectedPreference = resolve(statePaths.preferencePath);
     const expectedOwnership = resolve(statePaths.ownershipPath);
     if (resolve(loadedState.preferencePath) !== expectedPreference || resolve(loadedState.ownershipPath) !== expectedOwnership) {
@@ -670,9 +774,9 @@ export async function planSync(
     const preferenceSnapshot = statePathsSnapshots.get(expectedPreference);
     const ownershipSnapshot = statePathsSnapshots.get(expectedOwnership);
     if (!preferenceSnapshot || !ownershipSnapshot) builder.findings.push(issue('MISSING_STATE_PRECONDITION', 'The loaded state does not include snapshots for the approved metadata paths.'));
-    const preferencesRoot = approvedRequest.configuration === 'project' ? [projectRoot] : [configRoot];
+    const preferencesRoot = approvedRequest.configuration === 'project' ? projectRoots : configRoots;
     const preferenceSafe = await inspectScopedPath(expectedPreference, preferencesRoot);
-    const ownershipSafe = await inspectScopedPath(expectedOwnership, [stateRoot]);
+    const ownershipSafe = await inspectScopedPath(expectedOwnership, stateRoots);
     if (!preferenceSafe.safe || !preferenceSafe.snapshot || !ownershipSafe.safe || !ownershipSafe.snapshot) {
       builder.findings.push(issue('UNSAFE_STATE_PATH', 'A state metadata path escapes its approved private or project scope.'));
     } else {
@@ -692,10 +796,10 @@ export async function planSync(
       const preferenceParent = dirname(expectedPreference);
       const ownershipParent = dirname(expectedOwnership);
       const preferenceParentSafe = await inspectScopedPath(preferenceParent, preferencesRoot);
-      const ownershipParentSafe = await inspectScopedPath(ownershipParent, [stateRoot]);
+      const ownershipParentSafe = await inspectScopedPath(ownershipParent, stateRoots);
       if (preferenceDifferent && preferenceSnapshot && preferenceParentSafe.safe && preferenceParentSafe.snapshot) {
         builder.addPrecondition(preferenceParentSafe.snapshot);
-        const root = approvedRequest.configuration === 'project' ? projectRoot : configRoot;
+        const root = preferencesRoot.find(candidate => isWithin(candidate, preferenceParent)) ?? projectRoot;
         const expectedByPath = new Map([[preferenceParent, preferenceParentSafe.snapshot], [expectedPreference, preferenceSnapshot]]);
         await addDirsForDestination(builder, preferenceParent, root, expectedByPath, [], 'state');
         builder.addOperation({ kind: 'write', path: expectedPreference, expected: preferenceSnapshot,
@@ -704,7 +808,7 @@ export async function planSync(
       if (ownershipDifferent && ownershipSnapshot && ownershipParentSafe.safe && ownershipParentSafe.snapshot) {
         builder.addPrecondition(ownershipParentSafe.snapshot);
         const expectedByPath = new Map([[ownershipParent, ownershipParentSafe.snapshot], [expectedOwnership, ownershipSnapshot]]);
-        await addDirsForDestination(builder, ownershipParent, stateRoot, expectedByPath, [], 'state');
+        await addDirsForDestination(builder, ownershipParent, stateRoots.find(candidate => isWithin(candidate, ownershipParent)) ?? stateRoot, expectedByPath, [], 'state');
         builder.addOperation({ kind: 'write', path: expectedOwnership, expected: ownershipSnapshot,
           content: { kind: 'bytes', bytes: ownershipBytes }, mode: 0o600, resourceIds: [], purpose: 'state', description: 'Record synchronization ownership receipts.' });
       }

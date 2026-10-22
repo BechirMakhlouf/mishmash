@@ -120,7 +120,70 @@ it('plans links only when relevant and avoids a redundant link for an authority 
     request([alreadySelected.id], [{ agentId: 'codex', placement: 'project' }], { skillMode: 'link' }), await loadState());
   expect(resources(alreadyDiscovered.operations)).toEqual([]);
   expect(alreadyDiscovered.summary.unchanged).toBe(1);
+  const userPlacement = await planSync(sandbox.context, inventory,
+    request([alreadySelected.id], [{ agentId: 'codex', placement: 'user' }]), await loadState());
+  expect(userPlacement.findings.some(finding => finding.severity === 'error')).toBe(false);
+  const userTarget = join(sandbox.context.homeDir, '.agents', 'skills', 'already-authority');
+  expect(resources(userPlacement.operations).some(operation => operation.kind === 'write' && operation.path.startsWith(userTarget))).toBe(true);
+
 });
+
+it('coalesces aliased native skill destinations and links from their physical parent', async () => {
+  sandbox = await createSandbox();
+  const physicalRoot = join(sandbox.context.projectRoot, 'physical-skills');
+  await mkdir(join(physicalRoot, 'skills'), { recursive: true });
+  await symlink(physicalRoot, join(sandbox.context.projectRoot, '.agents'));
+  await symlink(physicalRoot, join(sandbox.context.projectRoot, '.gemini'));
+  const sourceRoot = join(sandbox.context.projectRoot, 'provided-skills');
+  const copiedPath = await putSkill(sourceRoot, 'aliased-copy', 'Shared guidance');
+  const linkedPath = await putSkill(sourceRoot, 'aliased-link', 'Linked guidance');
+  const inventory = await discover({
+    ...sandbox.context,
+    extraSources: [sourceRef('shared', sourceRoot, 'project', 'shared', 'Provided directory')],
+  });
+  const copied = skill(inventory, 'aliased-copy', copiedPath);
+  const before = await snapshotPath(sandbox.root);
+  const copyPlan = await planSync(sandbox.context, inventory,
+    request([copied.id], [
+      { agentId: 'codex', placement: 'project' },
+      { agentId: 'gemini-cli', placement: 'project' },
+    ]), await loadState());
+  expect(copyPlan.findings.some(finding => finding.severity === 'error')).toBe(false);
+  const copyOperations = resources(copyPlan.operations);
+  expect(new Set(copyOperations.map(operation => operation.path)).size).toBe(copyOperations.length);
+  expect(copyOperations.filter(operation => operation.kind === 'write' && operation.path.endsWith('/SKILL.md'))).toHaveLength(1);
+  const target = join(physicalRoot, 'skills', 'aliased-copy');
+  expect(copyOperations.filter(operation => operation.kind === 'mkdir' && operation.path === target)).toHaveLength(1);
+  const ownership = decodeOwnershipState(JSON.parse(Buffer.from(stateContent(copyPlan, '/mishmash/ownership.json')).toString('utf8')) as unknown);
+  expect(ownership.receipts.filter(receipt => receipt.resourceId === copied.id)).toHaveLength(1);
+  expect(ownership.receipts.find(receipt => receipt.resourceId === copied.id)?.path).toBe(target);
+
+  const linked = skill(inventory, 'aliased-link', linkedPath);
+  const linkPlan = await planSync(sandbox.context, inventory,
+    request([linked.id], [{ agentId: 'codex', placement: 'project' }], { skillMode: 'link' }), await loadState());
+  const link = resources(linkPlan.operations).find(operation => operation.kind === 'symlink');
+  expect(link?.kind).toBe('symlink');
+  if (!link || link.kind !== 'symlink') throw new Error('Expected a planned skill symlink');
+  expect(resolve(dirname(link.path), link.target)).toBe(linked.path);
+  expect(await snapshotMatches(before)).toBe(true);
+});
+
+it('blocks skill metadata names that do not match their native directory names', async () => {
+  sandbox = await createSandbox();
+  const root = join(sandbox.context.projectRoot, 'provided-skills');
+  const source = await putSkill(root, 'physical-name', 'Temporary description');
+  await putFile(join(source, 'SKILL.md'), '---\nname: logical-name\ndescription: Stable policy\n---\nBody\n');
+  const inventory = await discover({
+    ...sandbox.context,
+    extraSources: [sourceRef('shared', root, 'project', 'shared', 'Provided directory')],
+  });
+  const selected = skill(inventory, 'logical-name', source);
+  const plan = await planSync(sandbox.context, inventory,
+    request([selected.id], [{ agentId: 'codex', placement: 'project' }]), await loadState());
+  expect(plan.findings.some(finding => finding.code === 'SKILL_NAME_DIRECTORY_MISMATCH' && finding.path === source)).toBe(true);
+  expect(resources(plan.operations)).toEqual([]);
+});
+
 
 it('blocks private-project publication and destinations reached through escaping parent symlinks', async () => {
   sandbox = await createSandbox();
@@ -146,6 +209,18 @@ it('blocks private-project publication and destinations reached through escaping
   const published = await planSync(sandbox.context, userInventory,
     request([userResource.id], [{ agentId: 'codex', placement: 'project' }]), await loadState());
   expect(published.findings.some(finding => finding.code === 'PRIVATE_RESOURCE_PUBLICATION')).toBe(true);
+  const projectStorage = await planSync(sandbox.context, userInventory,
+    request([userResource.id], [{ agentId: 'codex', placement: 'user' }], { configuration: 'project' }),
+    await readState(sandbox.context, 'project'));
+  expect(projectStorage.findings.some(finding => finding.code === 'PRIVATE_AUTHORITY_SHARED_STORAGE')).toBe(true);
+  expect(projectStorage.operations.filter(operation => operation.purpose === 'state')).toEqual([]);
+  const userStorage = await planSync(sandbox.context, userInventory,
+    request([userResource.id], [{ agentId: 'codex', placement: 'user' }], { configuration: 'user' }),
+    await readState(sandbox.context, 'user'));
+  expect(userStorage.findings.some(finding => finding.code === 'PRIVATE_AUTHORITY_SHARED_STORAGE')).toBe(false);
+  expect(userStorage.operations.some(operation => operation.purpose === 'state' && operation.kind === 'write'
+    && operation.path.endsWith('/mishmash/sources.json'))).toBe(true);
+
 
   const outside = join(sandbox.root, 'outside-project');
   await mkdir(outside, { recursive: true });
@@ -297,6 +372,27 @@ it('plans safe preference and ownership intents while preserving unrelated remem
   expect(ownership.receipts.some(receipt => receipt.kind === 'skill' && receipt.resourceId === selected.id)).toBe(true);
   expect(JSON.stringify({ summary: plan.summary, findings: plan.findings, receipts: ownership.receipts, choices })).not.toContain('credential-marker');
   expect(plan.operations.filter(operation => operation.purpose === 'state').every(operation => operation.kind === 'mkdir' || operation.kind === 'write')).toBe(true);
+});
+
+it('plans private metadata beneath absent approved XDG roots without creating them', async () => {
+  sandbox = await createSandbox();
+  const sourceRoot = join(sandbox.context.projectRoot, '.claude', 'skills');
+  const source = await putSkill(sourceRoot, 'first-run', 'First run skill');
+  await rm(sandbox.context.configHome, { recursive: true, force: true });
+  await rm(sandbox.context.stateHome, { recursive: true, force: true });
+  const before = await snapshotPath(sandbox.root);
+  const inventory = await inventoryFor();
+  const selected = skill(inventory, 'first-run', source);
+  const state = await readState(sandbox.context, 'private-project');
+  const paths = await getStatePaths(sandbox.context, 'private-project');
+  const plan = await planSync(sandbox.context, inventory,
+    request([selected.id], [{ agentId: 'codex', placement: 'user' }]), state);
+  expect(plan.findings.some(finding => finding.severity === 'error')).toBe(false);
+  expect(plan.operations.some(operation => operation.purpose === 'state' && operation.kind === 'write' && operation.path === paths.preferencePath)).toBe(true);
+  expect(plan.operations.some(operation => operation.purpose === 'state' && operation.kind === 'write' && operation.path === paths.ownershipPath)).toBe(true);
+  expect(plan.operations.some(operation => operation.purpose === 'state' && operation.kind === 'mkdir' && operation.path === sandbox!.context.configHome)).toBe(true);
+  expect(plan.operations.some(operation => operation.purpose === 'state' && operation.kind === 'mkdir' && operation.path === sandbox!.context.stateHome)).toBe(true);
+  expect(await snapshotMatches(before)).toBe(true);
 });
 
 it('removes obsolete assets only inside the selected owned skill and keeps unrelated destination skills', async () => {
