@@ -212,6 +212,7 @@ function resolveSymlinkPath(input: string, links: ReadonlyMap<string, string>): 
   let current = resolve(input);
   const chain: string[] = [];
   const visited = new Set<string>();
+  let expansions = 0;
   for (;;) {
     let cursor = current;
     const suffix: string[] = [];
@@ -221,8 +222,9 @@ function resolveSymlinkPath(input: string, links: ReadonlyMap<string, string>): 
       suffix.unshift(basename(cursor));
       cursor = parent;
     }
-    if (visited.has(cursor)) return { path: current, chain, cycle: true };
-    visited.add(cursor);
+    const state = JSON.stringify([cursor, suffix]);
+    if (visited.has(state) || ++expansions > 40) return { path: current, chain, cycle: true };
+    visited.add(state);
     chain.push(cursor);
     current = resolve(dirname(cursor), links.get(cursor)!, ...suffix);
   }
@@ -259,11 +261,14 @@ function orderSymlinkChanges(operations: readonly Operation[], preconditions: re
     const path = resolve(operation.path);
     if (operation.kind === 'symlink') {
       const target = resolve(dirname(path), operation.target);
+      const resolution = resolveSymlinkPath(target, finalLinks);
+      if (resolution.cycle) findings.push(issue('SYMLINK_DEPENDENCY_CYCLE', 'A planned link target contains a dependency cycle.', path));
       for (const [candidate, dependency] of byPath) {
-        if (dependency.kind === 'remove' && isWithin(candidate, target)) {
+        if (dependency.kind === 'remove' && isWithin(candidate, resolution.path)) {
           findings.push(issue('SYMLINK_TARGET_REMOVED', 'A planned link targets an obsolete symlink destination.', path));
-        } else if (dependency.kind === 'symlink' && isWithin(candidate, target)) addEdge(candidate, path);
+        }
       }
+      for (const candidate of resolution.chain) if (byPath.get(candidate)?.kind === 'symlink') addEdge(candidate, path);
     }
     if (operation.expected.kind === 'symlink') {
       const oldTarget = resolve(dirname(path), operation.expected.linkTarget ?? '');
