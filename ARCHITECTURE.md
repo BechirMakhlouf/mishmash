@@ -51,7 +51,7 @@ Share the standard skill reader across native adapters and explicitly supplied s
 | `Plan` | Selected authorities, operations, resolved scopes/paths, warnings/blockers, expected snapshots and metadata write intents |
 | `ApplyResult` | Changed/unchanged/skipped resources and destinations, backup location, recovery status and safe findings |
 
-Resource identity is not its display name or content hash. Two same-named resources remain separate instances. The same physical source discovered by several agents retains all provenance without becoming several independent copies.
+Resource identity is not a display name or content hash. A `SourceRef.id` is the normalized resolved source path plus logical scope and visibility; it excludes the discovering agent and label. Native adapters realpath existing source roots/configs before constructing `SourceRef`, while `CheckedLocation` retains the configured alias. Shared roots use `agentId: 'shared'` and retain detecting agents in provenance; compatibility paths retain their native owner. Same-name resources at different source identities remain separate; one physical source discovered by several agents is one instance with all provenance.
 
 Logical scope is not determined solely by file location: a project-private MCP entry may be stored under the home directory. Do not flatten user resources into project resources. Unclassified privacy must not become permission to publish globally.
 
@@ -74,6 +74,8 @@ The concrete domain and adapter shapes are defined in `src/model.ts` and `src/ag
 `approvedRequest` contains selected IDs, resolved authority, destination agents, explicit placement and relevant copy/link choices, not callbacks or UI objects. The UI receives a safe plan summary; internal file payloads may contain secrets and must never be serialized into terminal output. Apply rejects false/missing confirmation and already-aborted work without writes. The flow still calls apply only after an affirmative answer; no confirmation-token framework is needed.
 
 The foundation exports `snapshotPath`, `snapshotMatches`, `snapshotsEqual`, `fingerprintValue`, `isWithin` and safe filesystem findings; shared skills use `sourceRef`, `resourceId`, `readSkillDirectory` and `discoverSkills`. `readJsonDocument`/`editJsonDocument` share safe JSONC parsing and targeted edits. State uses `getStatePaths`, `readState` and explicit authority/ownership/journal codecs. Native adapters export named `NativeAdapter` values; `prepareMcpEdit` returns file bytes/preconditions plus per-registration before/after fingerprints so the planner, not the adapter, enforces ownership. These shared readers/codecs never write.
+
+Native JSON/JSONC readers reject duplicate object keys, including nested registrations, before deriving ownership fingerprints or preparing edits. They never silently choose a last occurrence.
 
 ## 3. Discovery, authority and selection
 
@@ -155,6 +157,16 @@ Before apply, cancellation performs no writes. During apply, catchable cancellat
 
 The default `mishmash` invocation starts discovery in the selected/current project. Initially expose only `--help` and `--version` beyond that journey; context changes belong in prompts. Non-TTY invocation prints plain usage and exits without raw mode, animation or a blocked prompt. A noninteractive synchronization API is not required for this rewrite.
 
+At the start of the normal interactive run, render the user's supplied **mishmash** ASCII logo exactly once, before discovery/loading and the first prompt. Use a plain Clack message so it remains in ordinary scrollback, readable with color disabled; do not add a repeated intro/banner or custom renderer. At 60-column width, preserve the artwork verbatim and let the terminal wrap naturally rather than clipping or altering its characters. Non-TTY usage remains plain help without prompt-control sequences.
+
+```text
+███    ███ ██ ███████ ██   ██ ███    ███  █████  ███████ ██   ██
+████  ████ ██ ██      ██   ██ ████  ████ ██   ██ ██      ██   ██
+██ ████ ██ ██ ███████ ███████ ██ ████ ██ ███████ ███████ ███████
+██  ██  ██ ██      ██ ██   ██ ██  ██  ██ ██   ██      ██ ██   ██
+██      ██ ██ ███████ ██   ██ ██      ██ ██   ██ ███████ ██   ██
+```
+
 Use the library's ready-made `autocompleteMultiselect`, `select`, `confirm`, cancellation and spinner/task components. `autocompleteMultiselect` provides filtering, `initialValues`, `required` and bounded `maxItems`; verify against the pinned release. See the [Clack API](https://github.com/bombshell-dev/clack/tree/main/packages/prompts) and [interaction reference](https://github.com/vercel-labs/skills). Do not copy a custom picker from the reference project.
 
 - Stop discovery loading with a useful detected-resource summary; distinguish detected agents from supported-only destinations.
@@ -167,6 +179,7 @@ Use the library's ready-made `autocompleteMultiselect`, `select`, `confirm`, can
 - Sanitize filesystem-derived text before rendering. Never print MCP bodies, sensitive arguments/headers/environment values or raw native parser errors.
 - Honor disabled color and Clack's own keyboard instructions. Use normal scrollback; do not clear the screen or enter alternate screen.
 - Wrap actual work with spinners that stop in `finally`; no artificial waits or fake percentages. The CLI owns signal handlers; prompt and apply lifecycles consume cancellation without leaking listeners or intervals.
+- Print the logo once before discovery; redraw neither on prompt backtracking nor after an empty-discovery context change.
 
 UI functions call the same real core used by tests. There is no second UI-specific synchronization implementation.
 

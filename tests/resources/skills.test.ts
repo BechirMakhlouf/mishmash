@@ -7,6 +7,17 @@ import { createSandbox, putFile, putSkill, type Sandbox } from '../helpers/sandb
 
 let sandbox: Sandbox | undefined;
 afterEach(async () => { await sandbox?.cleanup(); });
+it('shares one stable location identity across discovering agents but separates scopes', async () => {
+  sandbox = await createSandbox();
+  const root = join(sandbox.context.projectRoot, '.agents', 'skills');
+  await putSkill(root, 'review');
+  const nativeView = sourceRef('codex', root, 'project', 'shared', 'Codex shared skills');
+  const sharedView = sourceRef('shared', root, 'project', 'shared', 'Shared skills');
+  const userView = sourceRef('shared', root, 'user', 'shared', 'User skills');
+  expect(nativeView.id).toBe(sharedView.id);
+  expect(nativeView.id).not.toBe(userView.id);
+  expect((await discoverSkills(nativeView)).resources[0]?.id).toBe((await discoverSkills(sharedView)).resources[0]?.id);
+});
 it('discovers native metadata and complete assets without mutation', async () => {
   sandbox = await createSandbox();
   const root = join(sandbox.context.projectRoot, '.claude', 'skills');
