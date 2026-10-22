@@ -1,6 +1,0 @@
-{
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "mishmash adapter-specific non-secret MCP additions version 1",
-  "type": "object", "required": ["version", "mcpServers"], "additionalProperties": false,
-  "properties": { "version": { "const": 1 }, "mcpServers": { "type": "object", "additionalProperties": { "type": "object" } } }
-}
