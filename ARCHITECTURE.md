@@ -2,7 +2,7 @@
 
 ## Status and scope
 
-This is the proposed implementation design for [REQUIREMENTS.md](REQUIREMENTS.md), which remains authoritative. It records module boundaries, safety contracts, Vitest coverage, and isolated agent work assignments. It does not restore the rejected application or claim a working replacement. The only addition at this stage is this requested design document.
+This is the implementation design for [REQUIREMENTS.md](REQUIREMENTS.md), which remains authoritative. Implementation has started under the user's authorization. The shared foundation provides real snapshot, skill-reading and state-codec behavior; product readiness still requires the complete journey and verification gate below. No historical application code is reused.
 
 Build one npm package with TypeScript ESM, Node.js **22.20 or newer**, a straightforward `tsc` build, `@clack/prompts`, and Vitest. No monorepo, Ink/React, custom renderer/picker, generic workflow framework, dependency-injection container, agent installer, daemon, telemetry, or terminal automation harness.
 
@@ -59,7 +59,7 @@ The foundation commit must fix concrete TypeScript signatures for discovery, aut
 
 ### Entry-point contracts
 
-These are proposed APIs, not existing implementation. The foundation freezes their concrete TypeScript input/result shapes before workers branch. Keep native parsed-document types inside their adapters and private transaction machinery inside `fs/`, not in a universal model.
+The concrete domain and adapter shapes are defined in `src/model.ts` and `src/agents/contract.ts`. The shared foundation is implemented; the entry points below are assigned to workers. Keep native parsed-document types inside their adapters and private transaction machinery inside `fs/`, not in a universal model.
 
 | Entry point | Boundary |
 | --- | --- |
@@ -72,6 +72,8 @@ These are proposed APIs, not existing implementation. The foundation freezes the
 | `recoverTransaction(transaction, { confirmed, signal })` | `Promise<RecoveryResult>`; explicit approval before recovery writes |
 
 `approvedRequest` contains selected IDs, resolved authority, destination agents, explicit placement and relevant copy/link choices, not callbacks or UI objects. The UI receives a safe plan summary; internal file payloads may contain secrets and must never be serialized into terminal output. Apply rejects false/missing confirmation and already-aborted work without writes. The flow still calls apply only after an affirmative answer; no confirmation-token framework is needed.
+
+The foundation exports `snapshotPath`, `snapshotMatches`, `snapshotsEqual`, `fingerprintValue`, `isWithin` and safe filesystem findings; shared skills use `sourceRef`, `resourceId`, `readSkillDirectory` and `discoverSkills`. `readJsonDocument`/`editJsonDocument` share safe JSONC parsing and targeted edits. State uses `getStatePaths`, `readState` and explicit authority/ownership/journal codecs. Native adapters export named `NativeAdapter` values; `prepareMcpEdit` returns file bytes/preconditions plus per-registration before/after fingerprints so the planner, not the adapter, enforces ownership. These shared readers/codecs never write.
 
 ## 3. Discovery, authority and selection
 
@@ -113,7 +115,7 @@ Use syntax-aware editors appropriate to actual JSON/JSONC/TOML documents. Prepar
 
 | Record | Proposed location | Contents |
 | --- | --- | --- |
-| Shared project authority choices | `<project>/.mishmash/sources.json` | Project-relative source references and explicit authority overrides |
+| Shared project authority choices | `<project>/.mishmash/sources.json` | Exact source references and explicit authority overrides; moving context requires review rather than silently relocating authority |
 | User authority choices | `$XDG_CONFIG_HOME/mishmash/sources.json` | User-wide source references |
 | Private project authority choices | `$XDG_CONFIG_HOME/mishmash/projects/<project-id>.json` | Private choices keyed by real project root; never copied into a shared project file |
 | Ownership receipts | `$XDG_STATE_HOME/mishmash/ownership.json` | Physical destination slots, source identities and last-applied fingerprints |
@@ -208,7 +210,7 @@ Clack owns focus, toggling and hidden-selection retention. Core tests prove full
 
 One **integration owner** controls the main checkout on `feat/clack-rewrite`, shared contracts, dependencies and merge queue. Workers use separate branches/worktrees and never edit the integration checkout or another worker's files.
 
-**Commit the reset before branching.** Worktrees contain committed trees, not pending deletions or untracked files. At the time this plan is written, the reset/document changes are uncommitted; branching from the earlier `HEAD` would resurrect the rejected application. This documentation request does not authorize creating commits or implementing the app.
+**Commit the reset before branching.** Worktrees contain committed trees, not pending deletions or untracked files. The approved reset/document baseline is recorded in `9c34f10`; a verified shared foundation must also be committed before workers branch. The user has now authorized implementation under this protocol.
 
 Before implementation workers start:
 
@@ -221,7 +223,7 @@ The foundation is usable shared code, not a placeholder app: no fake inventory, 
 The integration owner exclusively owns:
 
 - `package.json`, `package-lock.json`, `.gitignore`, `tsconfig.json`, `vitest.config.ts` and approved root build/test configuration.
-- `src/model.ts`, `src/agents/contract.ts`, `src/agents/index.ts`, `src/state.ts`, `src/fs/snapshot.ts`, `src/resources/skills.ts` and their tests: `tests/state.test.ts`, `tests/fs/snapshot.test.ts`, `tests/resources/skills.test.ts`.
+- `src/model.ts`, `src/agents/contract.ts`, `src/agents/index.ts`, `src/state.ts`, `src/fs/snapshot.ts`, `src/resources/skills.ts`, `src/resources/jsonc.ts` and their tests: `tests/state.test.ts`, `tests/fs/snapshot.test.ts`, `tests/resources/{skills,jsonc}.test.ts`.
 - `tests/helpers/**`, `tests/fixtures/**`, `tests/agents/contracts.test.ts`, `tests/integration/**` and usage/architecture documentation.
 
 Only this owner installs/adds native-format parser dependencies or changes shared types, helpers, registry and lockfiles. Add the real registry when adapter implementations are merged, not before. `REQUIREMENTS.md` remains authoritative and unchanged by worker slices.
