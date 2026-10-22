@@ -1,6 +1,6 @@
 import { chmodSync, readFileSync, renameSync, symlinkSync, writeFileSync } from 'node:fs';
 import { chmod, lstat, mkdir, readFile, readdir, readlink, rename, stat, symlink } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { dirname, join, sep } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { Context, Operation, PathSnapshot, Plan } from '../../src/model.js';
 import { applyPlan } from '../../src/fs/apply.js';
@@ -396,5 +396,25 @@ describe('applyPlan', () => {
     expect((await applyPlan(reviewed, { confirmed: true })).status).toBe('blocked');
     expect(snapshotsEqual(before, await snapshotPath(root))).toBe(true);
     expect((await readdir(context.stateHome)).length).toBe(0);
+  });
+
+  it.skipIf(sep !== '/')('applies nested output with literal POSIX backslashes without inventing path components', async () => {
+    const { context } = await sandbox();
+    const source = join(context.projectRoot, 'provided\\skills');
+    const output = join(context.projectRoot, 'approved\\skills');
+    const nested = join(output, 'nested\\assets');
+    const sourceFile = join(source, 'binary\\asset');
+    const target = join(nested, 'binary\\asset');
+    const binary = Uint8Array.from([0, 255, 128, 42]);
+    await putFile(sourceFile, binary, 0o640);
+    const sourceBefore = await snapshotPath(source);
+    const reviewed = plan(context, [await directory(output), await directory(nested), await copy(sourceFile, target, 0o640)], [sourceBefore, await snapshotPath(context.projectRoot)]);
+    expect((await applyPlan(reviewed, { confirmed: true })).status).toBe('applied');
+    expect(await bytesEqual(target, binary)).toBe(true);
+    expect((await stat(target)).mode & 0o777).toBe(0o640);
+    expect((await readdir(context.projectRoot)).includes('approved\\skills')).toBe(true);
+    expect((await readdir(output)).includes('nested\\assets')).toBe(true);
+    expect((await snapshotPath(join(context.projectRoot, 'approved'))).kind).toBe('missing');
+    expect(snapshotsEqual(sourceBefore, await snapshotPath(source))).toBe(true);
   });
 });
