@@ -1,5 +1,5 @@
 import { afterEach, expect, it } from 'vitest';
-import { cp, mkdir, readFile, readlink, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { cp, mkdir, readFile, readlink, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { basename, dirname, join, resolve } from 'node:path';
 import type { AgentId, AuthorityConfig, DestinationRequest, OwnershipState, ResourceInstance, SyncRequest } from '../../src/model.js';
 import { discover } from '../../src/core/discover.js';
@@ -109,6 +109,48 @@ it('plans complete copy trees with binary assets, empty directories, executable 
   expect((await stat(join(target, 'scripts', 'inspect.sh'))).mode & 0o777).toBe(0o755);
   expect(await readFile(join(target, 'assets', 'bytes.bin'))).toEqual(Buffer.from([0, 255, 4, 17]));
   expect(await readlink(join(target, 'inspect-link'))).toBe('scripts/inspect-link');
+});
+
+it('preserves literal POSIX backslashes in internal skill links through apply', async () => {
+  sandbox = await createSandbox();
+  const source = await putSkill(join(sandbox.context.projectRoot, '.claude', 'skills'), 'backslash-link', 'Literal path guidance');
+  const directoryName = 'literal\\component';
+  const referent = join(source, directoryName, 'asset.txt');
+  await putFile(referent, 'literal backslash referent');
+  const linkTarget = `${directoryName}/asset.txt`;
+  await symlink(linkTarget, join(source, 'linked-asset'));
+  const target = join(sandbox.context.homeDir, '.agents', 'skills', 'backslash-link');
+  await mkdir(dirname(target), { recursive: true });
+  await mkdir(target, { recursive: true });
+  await writeFile(join(target, 'SKILL.md'), await readFile(join(source, 'SKILL.md')));
+  await putFile(join(target, directoryName, 'asset.txt'), 'literal backslash referent');
+  const previous = await snapshotPath(target);
+  const paths = await getStatePaths(sandbox.context, 'private-project');
+  const inventory = await inventoryFor();
+  const selected = skill(inventory, 'backslash-link', source);
+  const authority: AuthorityConfig = { version: 1, sources: [selected.source], resourceAuthorities: { 'skill:backslash-link': selected.id } };
+  const ownership: OwnershipState = { version: 1, receipts: [{
+    slotId: fingerprintValue([resolve(target), 'skill']), path: resolve(target), kind: 'skill', key: 'backslash-link',
+    sourceId: selected.source.id, resourceId: selected.id, fingerprint: previous.digest,
+  }] };
+  await mkdir(dirname(paths.preferencePath), { recursive: true });
+  await mkdir(dirname(paths.ownershipPath), { recursive: true, mode: 0o700 });
+  await writeFile(paths.preferencePath, encodeAuthorityConfig(authority), { mode: 0o600 });
+  await writeFile(paths.ownershipPath, encodeOwnershipState(ownership), { mode: 0o600 });
+  const before = await snapshotPath(sandbox.root);
+  const plan = await planSync(sandbox.context, inventory,
+    request([selected.id], [{ agentId: 'codex', placement: 'user' }], {
+      authority: { version: 1, sources: [selected.source], resourceAuthorities: { 'skill:backslash-link': selected.id } },
+    }), await loadState());
+  expect(plan.findings.some(finding => finding.severity === 'error')).toBe(false);
+  const link = resources(plan.operations).find(operation => operation.kind === 'symlink' && operation.path.endsWith('/linked-asset'));
+  expect(link?.kind === 'symlink' && link.target === linkTarget).toBe(true);
+  expect(resources(plan.operations)).toHaveLength(1);
+  expect(await snapshotMatches(before)).toBe(true);
+  const applied = await applyPlan(plan, { confirmed: true });
+  expect(applied.status, JSON.stringify(applied.findings)).toBe('applied');
+  expect(await realpath(join(target, 'linked-asset'))).toBe(join(target, directoryName, 'asset.txt'));
+  expect(await readFile(join(target, 'linked-asset'), 'utf8')).toBe('literal backslash referent');
 });
 
 it('resolves dot-dot after expanding a symlink component during apply', async () => {

@@ -212,7 +212,8 @@ function resolveSymlinkPath(base: string, input: string, links: ReadonlyMap<stri
   const basePath = resolve(base);
   const root = parse(basePath).root;
   const components = relative(root, basePath).split(sep).filter(Boolean);
-  const pending = input.split(/[\\/]/);
+  const separators = sep === '\\' ? /[\\/]/ : /\//;
+  const pending = input.split(separators);
   const chain: string[] = [];
   const visited = new Set<string>();
   let expansions = 0;
@@ -228,7 +229,7 @@ function resolveSymlinkPath(base: string, input: string, links: ReadonlyMap<stri
     visited.add(state);
     chain.push(candidate);
     if (isAbsolute(linkTarget)) components.length = 0;
-    pending.unshift(...linkTarget.split(/[\\/]/));
+    pending.unshift(...linkTarget.split(separators));
   }
   return { path: resolve(root, ...components), chain, cycle: false };
 }
