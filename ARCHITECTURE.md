@@ -75,6 +75,8 @@ The concrete domain and adapter shapes are defined in `src/model.ts` and `src/ag
 
 The foundation exports `snapshotPath`, `snapshotMatches`, `snapshotsEqual`, `fingerprintValue`, `isWithin` and safe filesystem findings; shared skills use `sourceRef`, `resourceId`, `readSkillDirectory` and `discoverSkills`. `readJsonDocument`/`editJsonDocument` share safe JSONC parsing and targeted edits. State uses `getStatePaths`, `readState` and explicit authority/ownership/journal codecs. Native adapters export named `NativeAdapter` values; `prepareMcpEdit` returns file bytes/preconditions plus per-registration before/after fingerprints so the planner, not the adapter, enforces ownership. These shared readers/codecs never write.
 
+Native JSON/JSONC readers reject duplicate object keys, including nested registrations, before deriving ownership fingerprints or preparing edits. They never silently choose a last occurrence.
+
 ## 3. Discovery, authority and selection
 
 Discovery is read-only and bounded to documented native/shared locations plus an explicitly supplied existing source directory. Return both inventory and checked-location findings, including unreadable or invalid sources. Detect agents through filesystem/configuration evidence only. Never invoke launchers, MCP servers, skill scripts, credential helpers or network requests.

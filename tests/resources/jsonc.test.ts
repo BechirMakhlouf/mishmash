@@ -27,3 +27,16 @@ it('returns safe findings for credential-bearing malformed files', async () => {
   expect(result.text).toBe('');
   expect(JSON.stringify(result.findings).includes(secret)).toBe(false);
 });
+
+it.each([
+  '{ "mcpServers": { "same": { "command": "first" }, "same": { "command": "second" } } }',
+  '{ "mcpServers": {}, "mcpServers": { "same": { "command": "second" } } }',
+])('blocks duplicate native registration keys rather than selecting a last writer', async text => {
+  sandbox = await createSandbox();
+  const path = join(sandbox.context.projectRoot, 'ambiguous.jsonc');
+  await putFile(path, text);
+  const result = await readJsonDocument(path);
+  expect(result.findings[0]?.code).toBe('INVALID_NATIVE_CONFIG');
+  expect(result.value).toEqual({});
+  expect(result.text).toBe('');
+});
