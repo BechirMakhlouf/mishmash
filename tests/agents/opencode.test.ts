@@ -288,4 +288,104 @@ describe('OpenCode native adapter', () => {
     expect(result.findings.some(finding => finding.code === 'INVALID_SKILL_METADATA')).toBe(true);
     expect(JSON.stringify(result.findings).includes(secret)).toBe(false);
   });
+  it.each(['header', 'oauth', 'argument', 'environment', 'nested'])('blocks relocation of relative native file references in %s without reading or exposing credentials', async field => {
+    const tokenName = `token-${randomUUID()}`;
+    const reference = `{file:./${tokenName}}`;
+    const sourceSecret = randomUUID();
+    const destinationSecret = randomUUID();
+    await putFile(join(sandbox.context.projectRoot, tokenName), sourceSecret);
+    await putFile(join(sandbox.context.configHome, 'opencode', tokenName), destinationSecret);
+    let native: Record<string, unknown>;
+    if (field === 'argument') native = { type: 'local', command: ['never', reference] };
+    else if (field === 'environment') native = { type: 'local', command: ['never'], environment: { TOKEN: reference } };
+    else if (field === 'oauth') native = { type: 'remote', url: 'https://example.test/mcp', oauth: { client_secret: reference } };
+    else if (field === 'nested') native = { type: 'remote', url: 'https://example.test/mcp', futureOption: { items: [{ value: reference }] } };
+    else native = { type: 'remote', url: 'https://example.test/mcp', headers: { Authorization: reference } };
+    await putFile(projectConfig(), JSON.stringify({ mcp: field === 'oauth' ? { servers: { selected: native } } : { selected: native } }));
+    const selected = mcp((await opencodeAdapter.discover(sandbox.context)).resources)[0]!;
+    const before = await snapshotPath(sandbox.root);
+    const result = await opencodeAdapter.prepareMcpEdit(sandbox.context, 'user', [selected]);
+    expect(result.files).toHaveLength(0);
+    expect(result.targets).toHaveLength(0);
+    expect(result.findings.some(finding => finding.code === 'UNSUPPORTED_MCP_RELOCATION')).toBe(true);
+    const diagnostics = JSON.stringify(result.findings);
+    expect([reference, tokenName, sourceSecret, destinationSecret].some(value => diagnostics.includes(value))).toBe(false);
+    expect(await snapshotMatches(before)).toBe(true);
+  });
+
+  it('preserves relative file references for unchanged lexical and physical config parents, including no-op preparation', async () => {
+    const native = { type: 'remote', url: 'https://example.test/mcp', headers: { Authorization: '{file:./not-read}' } };
+    await putFile(projectConfig(), JSON.stringify({ mcp: { selected: native } }));
+    const selected = mcp((await opencodeAdapter.discover(sandbox.context)).resources)[0]!;
+    const same = await opencodeAdapter.prepareMcpEdit(sandbox.context, 'project', [selected]);
+    expect(same.findings).toHaveLength(0);
+    expect(same.files).toHaveLength(0);
+    expect(same.targets).toHaveLength(1);
+    const sibling = `${projectConfig()}c`;
+    await putFile(sibling, '{}\n');
+    const before = await snapshotPath(sandbox.root);
+    const result = await opencodeAdapter.prepareMcpEdit(sandbox.context, 'project', [selected]);
+    expect(result.findings).toHaveLength(0);
+    expect(result.files[0]?.path).toBe(sibling);
+    const encoded: unknown = JSON.parse(Buffer.from(result.files[0]!.bytes).toString());
+    expect(fingerprintValue(registration(encoded, 'selected'))).toBe(fingerprintValue(native));
+    expect(await snapshotMatches(before)).toBe(true);
+    await expect(lstat(join(sandbox.context.projectRoot, 'not-read'))).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('blocks relative reference reuse when a linked config parent changes physical identity', async () => {
+    const first = join(sandbox.root, 'first-config');
+    const second = join(sandbox.root, 'second-config');
+    const native = { type: 'local', command: ['never'], environment: { TOKEN: '{file:../not-read}' } };
+    await putFile(join(first, 'opencode.json'), JSON.stringify({ mcp: { selected: native } }));
+    await putFile(join(second, 'opencode.json'), '{}');
+    const alias = join(sandbox.context.projectRoot, '.opencode');
+    await symlink(first, alias);
+    const selected = mcp((await opencodeAdapter.discover(sandbox.context)).resources)[0]!;
+    await unlink(alias);
+    await symlink(second, alias);
+    const before = await snapshotPath(sandbox.root);
+    const result = await opencodeAdapter.prepareMcpEdit(sandbox.context, 'project', [selected]);
+    expect(result.files).toHaveLength(0);
+    expect(result.targets).toHaveLength(0);
+    expect(result.findings.some(finding => finding.code === 'UNSUPPORTED_MCP_RELOCATION')).toBe(true);
+    expect(await snapshotMatches(before)).toBe(true);
+  });
+
+  it('blocks selected native paths that overlap exactly or through a legacy servers registration in either selection order', async () => {
+    const legacyRoot = join(sandbox.root, 'legacy-source');
+    const currentRoot = join(sandbox.root, 'current-source');
+    await putFile(join(legacyRoot, 'opencode.json'), JSON.stringify({ mcp: { servers: { type: 'local', command: ['never-legacy'] } } }));
+    await putFile(join(currentRoot, 'opencode.json'), JSON.stringify({ mcp: { servers: { foo: { type: 'local', command: ['never-current'] } } } }));
+    const legacy = mcp((await opencodeAdapter.discover({ ...sandbox.context, projectRoot: legacyRoot })).resources)[0]!;
+    const current = mcp((await opencodeAdapter.discover({ ...sandbox.context, projectRoot: currentRoot })).resources)[0]!;
+    for (const selected of [[legacy, current], [current, legacy], [current, current]]) {
+      const before = await snapshotPath(sandbox.root);
+      const result = await opencodeAdapter.prepareMcpEdit(sandbox.context, 'project', selected);
+      expect(result.files).toHaveLength(0);
+      expect(result.targets).toHaveLength(0);
+      expect(result.findings.some(finding => finding.code === 'MCP_SCHEMA_COLLISION')).toBe(true);
+      expect(await snapshotMatches(before)).toBe(true);
+    }
+  });
+
+  it('prepares disjoint flat and nested selected paths together without treating string prefixes as ancestry', async () => {
+    const legacyRoot = join(sandbox.root, 'legacy-source');
+    const currentRoot = join(sandbox.root, 'current-source');
+    const legacyNative = { type: 'local', command: ['never-legacy'] };
+    const currentNative = { type: 'local', command: ['never-current'] };
+    await putFile(join(legacyRoot, 'opencode.json'), JSON.stringify({ mcp: { 'servers-extra': legacyNative } }));
+    await putFile(join(currentRoot, 'opencode.json'), JSON.stringify({ mcp: { servers: { foo: currentNative } } }));
+    const legacy = mcp((await opencodeAdapter.discover({ ...sandbox.context, projectRoot: legacyRoot })).resources)[0]!;
+    const current = mcp((await opencodeAdapter.discover({ ...sandbox.context, projectRoot: currentRoot })).resources)[0]!;
+    const before = await snapshotPath(sandbox.root);
+    const result = await opencodeAdapter.prepareMcpEdit(sandbox.context, 'project', [legacy, current]);
+    expect(result.findings).toHaveLength(0);
+    expect(result.files).toHaveLength(1);
+    expect(result.targets).toHaveLength(2);
+    const encoded: unknown = JSON.parse(Buffer.from(result.files[0]!.bytes).toString());
+    expect(fingerprintValue(registration(encoded, 'servers-extra'))).toBe(fingerprintValue(legacyNative));
+    expect(fingerprintValue(registration(encoded, 'foo', true))).toBe(fingerprintValue(currentNative));
+    expect(await snapshotMatches(before)).toBe(true);
+  });
 });

@@ -247,6 +247,19 @@ export const piAdapter: NativeAdapter = {
       const document = await readConfig(path);
       if (document.findings.length) return { files: [], targets: [], findings: document.findings };
       const entries = isRecord(document.value.mcpServers) ? document.value.mcpServers : {};
+      const namespaceNames = Object.keys(entries);
+      if (placement === 'project') {
+        const inheritedPath = configPath(context, 'user');
+        try {
+          const inherited = await readConfig(inheritedPath);
+          if (inherited.findings.length) return { files: [], targets: [], findings: inherited.findings };
+          const inheritedEntries = isRecord(inherited.value.mcpServers) ? inherited.value.mcpServers : {};
+          if (Object.entries(inheritedEntries).some(([name, native]) => !definition(name, native))) {
+            return { files: [], targets: [], findings: [filesystemFinding(inheritedPath, 'INVALID_MCP_ENTRY')] };
+          }
+          namespaceNames.push(...Object.keys(inheritedEntries));
+        } catch { return { files: [], targets: [], findings: [filesystemFinding(inheritedPath)] }; }
+      }
       const changes: { path: string[]; value: unknown }[] = [];
       const targets: PreparedMcpTarget[] = [];
       const findings: Finding[] = [];
@@ -256,7 +269,8 @@ export const piAdapter: NativeAdapter = {
           findings.push(issue(path, 'PRIVATE_SCOPE_VIOLATION', 'A private project registration cannot be published to this Pi destination.')); continue;
         }
         const name = resource.name;
-        if (selected.has(name.replace(/-/g, '_')) || Object.keys(entries).some(key => key !== name && key.replace(/-/g, '_') === name.replace(/-/g, '_'))) {
+        if (selected.has(name.replace(/-/g, '_'))
+          || namespaceNames.some(key => key !== name && key.replace(/-/g, '_') === name.replace(/-/g, '_'))) {
           findings.push(issue(path, 'MCP_NAMESPACE_COLLISION', 'Selected registrations collide in the Pi tool namespace.')); continue;
         }
         selected.add(name.replace(/-/g, '_'));

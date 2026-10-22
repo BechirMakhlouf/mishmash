@@ -1,5 +1,5 @@
 import { lstat, readdir, realpath } from 'node:fs/promises';
-import { join, relative, resolve } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import type { Context, Finding, McpDefinition, McpResource, Placement, SkillResource, SourceRef } from '../model.js';
 import type { AdapterDiscovery, NativeAdapter, PreparedMcpEdit, PreparedMcpTarget } from './contract.js';
 import { errorCode, filesystemFinding, fingerprintValue } from '../fs/snapshot.js';
@@ -94,6 +94,20 @@ function nativeSchema(resource: McpResource): Schema | undefined {
     if (path.length === 3 && path[1] === 'servers') return 'current';
   } catch { /* A locator is not a source of executable code or diagnostics. */ }
   return;
+}
+function hasRelativeFileReference(value: unknown): boolean {
+  if (typeof value === 'string') {
+    for (const match of value.matchAll(/\{file:([^}]+)\}/g)) {
+      const reference = match[1]!;
+      if (!isAbsolute(reference) && !reference.startsWith('~/')) return true;
+    }
+  } else if (Array.isArray(value)) return value.some(hasRelativeFileReference);
+  else if (isRecord(value)) return Object.entries(value).some(([key, entry]) => hasRelativeFileReference(key) || hasRelativeFileReference(entry));
+  return false;
+}
+function pathsOverlap(first: readonly string[], second: readonly string[]): boolean {
+  for (let index = 0; index < Math.min(first.length, second.length); index++) if (first[index] !== second[index]) return false;
+  return true;
 }
 async function present(path: string, findings: Finding[]): Promise<boolean> {
   try { await lstat(path); return true; }
@@ -224,8 +238,7 @@ export const opencodeAdapter: NativeAdapter = {
       const entries = registrations(document.value);
       const mcp = isRecord(document.value.mcp) ? document.value.mcp : {};
       const hasCurrent = isRecord(mcp.servers) && mcp.servers.type !== 'local' && mcp.servers.type !== 'remote';
-      const targets: PreparedMcpTarget[] = [];
-      const changes: { path: string[]; value: unknown }[] = [];
+      const staged: { resource: McpResource; native: Readonly<Record<string, unknown>>; nativePath: string[]; existing?: Registration }[] = [];
       const selected = new Set<string>();
       for (const resource of resources) {
         if (resource.source.scope === 'project' && resource.source.visibility === 'private') {
@@ -242,6 +255,11 @@ export const opencodeAdapter: NativeAdapter = {
         let schema: Schema = existing[0]?.schema ?? (hasCurrent ? 'current' : 'legacy');
         let native: Readonly<Record<string, unknown>>;
         if (value.nativeAgent === 'opencode') {
+          if ((hasRelativeFileReference(value.native) || hasRelativeFileReference(resource.name))
+            && (dirname(resource.snapshot.path) !== dirname(document.snapshot.path)
+              || dirname(resource.snapshot.resolvedPath) !== dirname(document.snapshot.resolvedPath))) {
+            findings.push(issue(path, 'UNSUPPORTED_MCP_RELOCATION', 'A relative native file reference would resolve from a different configuration directory.')); continue;
+          }
           const original = nativeSchema(resource);
           if (!original || (existing[0] && original !== schema)) {
             findings.push(issue(path, 'UNSUPPORTED_MCP_TRANSLATION', 'Different OpenCode MCP schemas require explicit native migration.')); continue;
@@ -267,12 +285,20 @@ export const opencodeAdapter: NativeAdapter = {
         }
         if (!definition(native, schema)) { findings.push(filesystemFinding(path, 'INVALID_MCP_ENTRY')); continue; }
         const nativePath = schema === 'current' ? ['mcp', 'servers', resource.name] : ['mcp', resource.name];
-        const before = existing[0] ? fingerprintValue(existing[0].native) : undefined;
+        if (staged.some(entry => pathsOverlap(entry.nativePath, nativePath))) {
+          findings.push(issue(path, 'MCP_SCHEMA_COLLISION', 'Selected native registration paths overlap in the OpenCode MCP namespace.')); continue;
+        }
+        staged.push({ resource, native, nativePath, existing: existing[0] });
+      }
+      if (findings.some(finding => finding.severity === 'error')) return { files: [], targets: [], findings };
+      const targets: PreparedMcpTarget[] = [];
+      const changes: { path: string[]; value: unknown }[] = [];
+      for (const { resource, native, nativePath, existing } of staged) {
+        const before = existing ? fingerprintValue(existing.native) : undefined;
         const after = fingerprintValue(native);
         targets.push({ resourceId: resource.id, key: resource.name, path: document.snapshot.resolvedPath, slotId: fingerprintValue([document.snapshot.resolvedPath, 'mcp', JSON.stringify(nativePath)]), ...(before === undefined ? {} : { beforeFingerprint: before }), afterFingerprint: after });
         if (before !== after) changes.push({ path: nativePath, value: native });
       }
-      if (findings.some(finding => finding.severity === 'error')) return { files: [], targets: [], findings };
       return { files: changes.length ? [{ path, bytes: editJsonDocument(document.text, changes), mode: document.snapshot.kind === 'missing' ? 0o600 : document.snapshot.mode, expected: document.snapshot }] : [], targets, findings };
     } catch { return { files: [], targets: [], findings: [filesystemFinding(path)] }; }
   },

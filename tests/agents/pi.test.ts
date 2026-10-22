@@ -220,6 +220,57 @@ describe('Pi native adapter', () => {
     expect(result.findings.some(finding => finding.code === 'MCP_NAMESPACE_COLLISION')).toBe(true);
   });
 
+  it.each([
+    ['foo_bar', 'foo-bar'],
+    ['foo-bar', 'foo_bar'],
+    ['foo_bar-baz', 'foo-bar_baz'],
+  ])('blocks project namespace collision between inherited %s and selected %s without changing user state', async (inheritedName, selectedName) => {
+    const secret = randomUUID();
+    await putFile(userConfig(), JSON.stringify({ mcpServers: { [inheritedName]: { command: 'never-user', env: { TOKEN: secret }, enabled: false } }, autoEnableCodemode: false }));
+    const sources = await openCodeSources({ [selectedName]: { type: 'local', command: ['never-project'] } });
+    const before = await snapshotPath(sandbox.root);
+    const userMtime = (await stat(userConfig())).mtimeMs;
+    const result = await piAdapter.prepareMcpEdit(sandbox.context, 'project', sources);
+    expect(result.files).toHaveLength(0);
+    expect(result.targets).toHaveLength(0);
+    expect(result.findings.some(finding => finding.code === 'MCP_NAMESPACE_COLLISION')).toBe(true);
+    expect(JSON.stringify(result.findings).includes(secret)).toBe(false);
+    expect((await stat(userConfig())).mtimeMs).toBe(userMtime);
+    expect(await snapshotMatches(before)).toBe(true);
+  });
+
+  it.each([
+    ['same_name', 'same_name'],
+    ['Foo_bar', 'foo-bar'],
+  ])('allows native exact-name overrides and case-sensitive distinct namespaces for %s and %s', async (inheritedName, selectedName) => {
+    await putFile(userConfig(), JSON.stringify({ mcpServers: { [inheritedName]: { command: 'never-user', args: ['retain'] } } }));
+    const sources = await openCodeSources({ [selectedName]: { type: 'local', command: ['never-project'] } });
+    const before = await snapshotPath(sandbox.root);
+    const result = await piAdapter.prepareMcpEdit(sandbox.context, 'project', sources);
+    expect(result.findings).toHaveLength(0);
+    expect(result.files).toHaveLength(1);
+    expect(result.files[0]?.path).toBe(projectConfig());
+    expect(result.targets[0]?.beforeFingerprint).toBeUndefined();
+    const encoded: unknown = JSON.parse(Buffer.from(result.files[0]!.bytes).toString());
+    expect(fingerprintValue(registration(encoded, selectedName))).toBe(fingerprintValue({ command: 'never-project', args: [] }));
+    expect(await snapshotMatches(before)).toBe(true);
+  });
+
+  it('blocks project output when inherited user configuration cannot be read safely', async () => {
+    const sources = await openCodeSources({ selected: { type: 'local', command: ['never-project'] } });
+    const secret = randomUUID();
+    for (const text of ['{"mcpServers":[]}', JSON.stringify({ mcpServers: { inherited: { command: 'never-user', env: { TOKEN: 7 }, description: secret } } })]) {
+      await putFile(userConfig(), text);
+      const before = await snapshotPath(sandbox.root);
+      const result = await piAdapter.prepareMcpEdit(sandbox.context, 'project', sources);
+      expect(result.files).toHaveLength(0);
+      expect(result.targets).toHaveLength(0);
+      expect(result.findings.some(finding => finding.severity === 'error' && finding.path === userConfig())).toBe(true);
+      expect(JSON.stringify(result.findings).includes(secret)).toBe(false);
+      expect(await snapshotMatches(before)).toBe(true);
+    }
+  });
+
   it('uses physical configuration paths in slot IDs when a native parent is linked', async () => {
     const physical = join(sandbox.root, 'pi-physical');
     await putFile(join(physical, 'mcp.json'), JSON.stringify({ mcpServers: {} }));
