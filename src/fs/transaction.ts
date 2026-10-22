@@ -103,11 +103,14 @@ export async function acquireLock(lockPath: string, reclaim = false, journal?: T
       return { snapshot: await snapshotPath(lockPath), identity: await identity(lockPath) };
     } catch (error) { if (error instanceof TransactionError) throw error; throw new TransactionError('UNSAFE_LOCK', lockPath); }
   });
-  return () => guardLock(lockPath, async () => {
+  return async () => {
+    // A guarded contender cannot replace a live owner's lock: acquisition rejects it,
+    // and reclamation checks that its PID is dead. Release therefore must not compete
+    // for that contender's short-lived guard or strand its own still-live lease.
     if (!await snapshotMatches(owned.snapshot) || fingerprintValue(owned.identity) !== fingerprintValue(await identity(lockPath))) throw new TransactionError('LOCK_CHANGED', lockPath);
     await unlink(lockPath);
     await syncDirectory(dirname(lockPath));
-  });
+  };
 }
 export async function persistJournal(path: string, journal: TransactionJournal, effects?: Effects): Promise<void> {
   const next = join(path, '.journal-next');

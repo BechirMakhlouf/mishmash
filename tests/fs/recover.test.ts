@@ -1,12 +1,12 @@
 import { writeFileSync } from 'node:fs';
-import { chmod, mkdir, readFile, readdir, readlink, rename, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, open, readFile, readdir, readlink, rename, rm, stat, symlink, unlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { Context, Plan, TransactionJournal } from '../../src/model.js';
 import { applyPlan } from '../../src/fs/apply.js';
 import { inspectRecovery, recoverTransaction } from '../../src/fs/recover.js';
 import { hashBytes, snapshotPath, snapshotsEqual } from '../../src/fs/snapshot.js';
-import { acquireLock } from '../../src/fs/transaction.js';
+import { acquireLock, syncDirectory } from '../../src/fs/transaction.js';
 import { encodeJournal, getStatePaths } from '../../src/state.js';
 import { createSandbox, putFile, type Sandbox } from '../helpers/sandbox.js';
 
@@ -333,5 +333,41 @@ describe('explicit transaction recovery', () => {
     expect((await stat(paths.lockPath, { bigint: true })).ino).toBe(external.ino);
     expect((await readFile(paths.lockPath)).equals(bytes)).toBe(true);
     expect((await snapshotPath(`${paths.lockPath}.guard`)).kind).toBe('missing');
+  });
+
+  it('releases its live lease while a contender holds the durable guard without deleting that guard or a later lease', async () => {
+    const { context } = await sandbox();
+    const transaction = await interruptedWrite(context);
+    const paths = await getStatePaths(context);
+    const intent: TransactionJournal = { version: 1, id: transaction.journal.id, context, status: 'prepared', entries: [] };
+    const release = await acquireLock(paths.lockPath, false, intent);
+    const owned = await snapshotPath(paths.lockPath);
+    // Pause the real interleaving after the contender's exclusive durable claim, before
+    // its lock inspection. The current owner is still live and must be able to finish.
+    const guard = `${paths.lockPath}.guard`;
+    const contenderGuard = await open(guard, 'wx', 0o600);
+    try {
+      await contenderGuard.writeFile(JSON.stringify({ pid: process.pid, token: 'held-contender-guard' }));
+      await contenderGuard.sync();
+      await syncDirectory(join(context.stateHome, 'mishmash'));
+      const guardBefore = await snapshotPath(guard);
+      const guardIdentity = await stat(guard, { bigint: true });
+      await expect(acquireLock(paths.lockPath, true, intent)).rejects.toThrow('LOCK_GUARD_PENDING');
+      expect(snapshotsEqual(owned, await snapshotPath(paths.lockPath))).toBe(true);
+      await release();
+      expect((await snapshotPath(paths.lockPath)).kind).toBe('missing');
+      expect(snapshotsEqual(guardBefore, await snapshotPath(guard))).toBe(true);
+      expect((await stat(guard, { bigint: true })).ino).toBe(guardIdentity.ino);
+      expect((await inspectRecovery(context)).findings.some(issue => issue.code === 'LOCK_GUARD_PENDING' && issue.path === guard)).toBe(true);
+    } finally { await contenderGuard.close(); }
+    // Only the test's contender removes its own guard; ordinary release never does.
+    await unlink(guard);
+    await syncDirectory(join(context.stateHome, 'mishmash'));
+    const releaseNext = await acquireLock(paths.lockPath, false, intent);
+    const next = await snapshotPath(paths.lockPath);
+    await expect(release()).rejects.toThrow('LOCK_CHANGED');
+    expect(snapshotsEqual(next, await snapshotPath(paths.lockPath))).toBe(true);
+    await releaseNext();
+    expect((await snapshotPath(paths.lockPath)).kind).toBe('missing');
   });
 });
