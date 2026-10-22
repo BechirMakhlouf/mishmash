@@ -125,6 +125,8 @@ Use syntax-aware editors appropriate to actual JSON/JSONC/TOML documents. Prepar
 
 Honor platform-appropriate XDG fallbacks. Use versioned JSON and explicit validation. Select the relevant authority configuration for review; do not silently combine conflicting project/private/user choices or use one as a missing-source fallback. Configuration scope and output placement are separate decisions.
 
+The shared project preference file must never contain a private `SourceRef` path or authority choice, even if the selected resource itself would not be copied into the project. If a reviewed selection includes a private user or private-project authority, persist it only in an explicitly chosen user-local/private-project configuration; if that configuration is not selected, block rather than leaking locators or silently splitting/repointing preferences.
+
 Preferences and receipts contain locators and fingerprints, not MCP bodies or credentials. Backup directories are owner-only; secret-bearing backup files are owner-readable/writable only. Preserve supported target modes independently. Include preference/receipt changes in the reviewed transaction. No directory, lock, state file, backup or `.gitignore` change occurs before confirmation. An unchanged rerun does not rewrite metadata or create a transaction directory just to log a no-op.
 
 ## 6. Read-only planning and recoverable application
