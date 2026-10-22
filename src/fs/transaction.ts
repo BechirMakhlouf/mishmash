@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
 import { chmod, lstat, mkdir, open, readFile, readdir, readlink, realpath, rename, rm, symlink, unlink } from 'node:fs/promises';
-import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import type { ApplyOptions, Context, Finding, JournalEntry, Operation, PathIdentity, PathSnapshot, TransactionJournal, TreeEntry } from '../model.js';
 import { decodeJournal, encodeJournal, getStatePaths } from '../state.js';
 import { errorCode, fingerprintValue, hashBytes, isWithin, snapshotMatches, snapshotPath, snapshotsEqual } from './snapshot.js';
@@ -212,7 +212,7 @@ export function adjustedSnapshot(original: PathSnapshot, effects: Effects): Path
   for (const effect of effects.snapshots) {
     if (effect.path === result.path) { result = { ...effect, entries: effect.entries.map(entry => ({ ...entry })) }; continue; }
     if (result.kind !== 'directory' || !isWithin(result.path, effect.path)) continue;
-    const rel = relative(result.path, effect.path).split('\\').join('/');
+    const rel = relative(result.path, effect.path).split(sep).join('/');
     const entries = result.entries.filter(entry => entry.relativePath !== rel && !entry.relativePath.startsWith(`${rel}/`));
     if (effect.kind !== 'missing') entries.push(...effect.entries.map(entry => ({ ...entry, relativePath: entry.relativePath ? `${rel}/${entry.relativePath}` : rel })));
     rebuild(entries);
