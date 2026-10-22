@@ -18,7 +18,7 @@ import type {
 } from '../model.js';
 import {
   renderApplyResult, renderDiscoverySummary, renderFinding,
-  renderPlanDetails, renderPlanReview, renderResourceLabel, renderSourceLabel,
+  renderPlanDetails, renderPlanReview, renderResourceLabel, renderSourceLabel, renderAuthorityName,
   sanitizeTerminalText,
 } from './render.js';
 
@@ -409,7 +409,7 @@ async function chooseAuthorities(
     const initial = selected[conflict.key] ?? remembered?.resourceAuthorities[conflict.key];
     while (!signal.aborted) {
       const prompt = await select<string | null>({
-        message: `Select the exact source for ${conflict.key.replace(/^(skill|mcp):/, '')}:`,
+        message: `Select the exact source for ${renderAuthorityName(conflict.key)}:`,
         options: [
           { value: null, label: 'Choose an authoritative source…', hint: 'No source is selected until you make a choice.' },
           ...candidates.map(resource => {

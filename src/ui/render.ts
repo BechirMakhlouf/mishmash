@@ -29,6 +29,11 @@ function short(value: string | undefined, limit = 88): string | undefined {
   return safe.length > limit ? `${safe.slice(0, limit - 1)}…` : safe;
 }
 
+export function renderAuthorityName(key: string): string {
+  const name = key.replace(/^(skill|mcp):/, '');
+  return short(name, 70) ?? '(unnamed resource)';
+}
+
 export function sourceScopeLabel(source: SourceRef): string {
   const scope = source.scope === 'project' && source.visibility === 'private' ? 'private project' : source.scope;
   return `${scope}, ${source.visibility}`;

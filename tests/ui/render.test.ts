@@ -2,7 +2,7 @@ import { expect, it } from 'vitest';
 import type { ApplyResult, Context, Inventory, LoadedState, McpResource, PathSnapshot, Plan, SkillResource, SourceRef } from '../../src/model.js';
 import {
   renderApplyResult, renderDiscoverySummary, renderPlanDetails, renderPlanReview,
-  renderResourceLabel, sanitizeTerminalText,
+  renderResourceLabel, renderAuthorityName, sanitizeTerminalText,
 } from '../../src/ui/render.js';
 
 const context: Context = {
@@ -32,6 +32,7 @@ const snapshot: PathSnapshot = {
 
 it('strips terminal controls and line injection from filesystem-derived labels and paths', () => {
   const safe = sanitizeTerminalText(hostilePath);
+  const authorityHeading = renderAuthorityName('skill:deploy\u001b[2J\nroot\u202e');
   const resource: SkillResource = {
     id: 'skill-id',
     kind: 'skill',
@@ -42,7 +43,7 @@ it('strips terminal controls and line injection from filesystem-derived labels a
     locator: 'deploy',
     snapshot,
   };
-  const rendered = [safe, ...Object.values(renderResourceLabel(resource)), ...renderDiscoverySummary({
+  const rendered = [safe, authorityHeading, ...Object.values(renderResourceLabel(resource)), ...renderDiscoverySummary({
     resources: [resource],
     sources: [source],
     detectedAgents: ['claude-code'],
