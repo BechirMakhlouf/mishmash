@@ -2,7 +2,7 @@ import { expect, it } from 'vitest';
 import type { ApplyResult, Context, Inventory, LoadedState, McpResource, PathSnapshot, Plan, SkillResource, SourceRef } from '../../src/model.js';
 import {
   renderApplyResult, renderDiscoverySummary, renderPlanDetails, renderPlanReview,
-  renderResourceLabel, renderAuthorityName, sanitizeTerminalText,
+  renderResourceLabel, renderSourceLabel, renderAuthorityName, sanitizeTerminalText,
 } from '../../src/ui/render.js';
 import { withClackSpinnerExitAbort } from '../../src/ui/flow.js';
 
@@ -56,6 +56,30 @@ it('strips terminal controls and line injection from filesystem-derived labels a
   expect(rendered).not.toContain('OSC-SECRET');
   expect(rendered).toContain('deploy');
   expect(rendered).toContain('/tmp/source/red line');
+});
+
+it('replaces invalid persisted agent provenance with a safe label', () => {
+  const marker = 'UNTRUSTED-AGENT-ID-MARKER';
+  const untrustedSource: SourceRef = { ...source };
+  Reflect.set(untrustedSource, 'agents', [`\u001b[2J\n${marker}`]);
+  const resource: SkillResource = {
+    id: 'hostile-provenance-skill',
+    kind: 'skill',
+    name: 'safe-name',
+    source: untrustedSource,
+    path: hostilePath,
+    locator: 'safe-name',
+    snapshot,
+  };
+  const output = [
+    ...Object.values(renderSourceLabel(untrustedSource)),
+    ...Object.values(renderResourceLabel(resource)),
+    ...renderDiscoverySummary({ resources: [resource], sources: [untrustedSource], detectedAgents: [], checkedLocations: [], findings: [] }),
+  ].join(' ');
+
+  expect(output).not.toContain(marker);
+  expect(output).not.toMatch(/[\u001b\u009b\u009d\u0000-\u001f\u007f-\u009f\u202a-\u202e]/);
+  expect(output).toContain('Unknown agent');
 });
 
 it('turns a Clack spinner exit request into an abort and restores process.exit', async () => {

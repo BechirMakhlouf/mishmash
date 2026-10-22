@@ -4,7 +4,7 @@ import type {
 } from '../model.js';
 import { nativeAdapters } from '../agents/index.js';
 
-const adapterLabels = new Map<AgentId, string>(nativeAdapters.map(adapter => [adapter.id, adapter.label]));
+const adapterLabels = new Map<string, string>(nativeAdapters.map(adapter => [adapter.id, adapter.label] as const));
 
 /** Remove terminal control sequences and invisible direction/format controls from untrusted text. */
 export function sanitizeTerminalText(value: string): string {
@@ -39,8 +39,9 @@ export function sourceScopeLabel(source: SourceRef): string {
   return `${scope}, ${source.visibility}`;
 }
 
-function agentLabel(id: AgentId | 'shared'): string {
-  return id === 'shared' ? 'Shared directory' : adapterLabels.get(id) ?? id;
+function agentLabel(id: string): string {
+  if (id === 'shared') return 'Shared directory';
+  return adapterLabels.get(id) ?? 'Unknown agent';
 }
 
 function sourceAttribution(source: SourceRef): string {
