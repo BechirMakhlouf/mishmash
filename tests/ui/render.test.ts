@@ -129,11 +129,13 @@ it('keeps credential-bearing MCP definitions and bodies out of safe review proje
     id: 'mcp-copilot-id',
     definition: { ...mcp.definition, nativeAgent: 'github-copilot-cli' },
   };
+  const checkedPath = '/checked/native/settings.json';
+  const checkedLocation = { agentId: 'claude-code', path: checkedPath, kind: 'mcp', scope: 'project', exists: false } as const;
   const inventory: Inventory = {
     resources: [mcp, copilot],
     sources: [source],
     detectedAgents: ['claude-code', 'github-copilot-cli'],
-    checkedLocations: [],
+    checkedLocations: [checkedLocation],
     findings: [],
   };
   const state: LoadedState = {
@@ -179,6 +181,13 @@ it('keeps credential-bearing MCP definitions and bodies out of safe review proje
     },
   };
   const applied: ApplyResult = { status: 'applied', changed: 1, unchanged: 0, findings: [] };
+  const populatedSummary = renderDiscoverySummary(inventory).join(' ');
+  const emptySummary = renderDiscoverySummary({ ...inventory, resources: [] }).join(' ');
+  const detailedPlan = renderPlanDetails(plan, [mcp, copilot], [checkedLocation]).join(' ');
+  expect(populatedSummary).not.toContain(checkedPath);
+  expect(populatedSummary).toContain(mcp.name);
+  expect(emptySummary).toContain(checkedPath);
+  expect(detailedPlan).toContain(checkedPath);
   const claudeView = renderResourceLabel(mcp);
   const copilotView = renderResourceLabel(copilot);
   const interpretationDetails = renderPlanDetails(plan, [mcp, copilot]).filter(line => line.includes(mcp.name));
@@ -187,9 +196,9 @@ it('keeps credential-bearing MCP definitions and bodies out of safe review proje
   expect(interpretationDetails[0]).not.toBe(interpretationDetails[1]);
   const projections = [
     renderResourceLabel(mcp).label,
-    ...renderDiscoverySummary(inventory),
+    populatedSummary,
     ...renderPlanReview(plan, state, 1, [source]),
-    ...renderPlanDetails(plan, [mcp, copilot]),
+    ...renderPlanDetails(plan, [mcp, copilot], [checkedLocation]),
     ...renderApplyResult(applied),
   ].join(' ');
 
