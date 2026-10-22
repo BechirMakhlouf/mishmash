@@ -1,6 +1,6 @@
 import { chmodSync, readFileSync, renameSync, symlinkSync, writeFileSync } from 'node:fs';
 import { chmod, lstat, mkdir, readFile, readdir, readlink, rename, stat, symlink } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { dirname, join, sep } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { Context, Operation, PathSnapshot, Plan } from '../../src/model.js';
 import { applyPlan } from '../../src/fs/apply.js';
@@ -356,5 +356,65 @@ describe('applyPlan', () => {
     expect(await bytesEqual(join(output, 'b'), binary)).toBe(true);
     expect((await snapshotPath(join(output, 'a'))).resolvedPath).toBe(join(output, 'sub', 'b'));
     expect(snapshotsEqual(before, await snapshotPath(source))).toBe(true);
+  });
+
+  it('accepts a physically contained source link whose parent traversal lexically escapes', async () => {
+    const { context } = await sandbox();
+    const source = join(context.projectRoot, 'source');
+    const output = join(context.projectRoot, 'output');
+    const binary = Uint8Array.from([0, 255, 128, 42]);
+    await putFile(join(source, 'b'), binary, 0o640);
+    await mkdir(join(source, 'sub', 'deep'), { recursive: true });
+    await symlink('sub/deep', join(source, 'dir'));
+    await symlink('dir/../../b', join(source, 'a'));
+    const before = await snapshotPath(source);
+    const operations: Operation[] = [
+      await directory(output),
+      await directory(join(output, 'sub')),
+      await directory(join(output, 'sub', 'deep')),
+      await copy(join(source, 'b'), join(output, 'b'), 0o640),
+      await link(join(output, 'dir'), 'sub/deep'),
+      await link(join(output, 'a'), 'dir/../../b'),
+    ];
+    const result = await applyPlan(plan(context, operations, [before]), { confirmed: true });
+    expect(result.status).toBe('applied');
+    expect(await readlink(join(output, 'a'))).toBe('dir/../../b');
+    expect(await bytesEqual(join(output, 'a'), binary)).toBe(true);
+    expect((await snapshotPath(join(output, 'a'))).resolvedPath).toBe(join(output, 'b'));
+    expect(snapshotsEqual(before, await snapshotPath(source))).toBe(true);
+  });
+
+  it('blocks a physically escaping source link even when lexical normalization looks contained', async () => {
+    const { root, context } = await sandbox();
+    const source = join(context.projectRoot, 'source');
+    await putFile(join(source, 'b'), 'reviewed file');
+    await putFile(join(context.projectRoot, 'b'), 'unapproved external file');
+    await symlink('.', join(source, 'dir'));
+    await symlink('dir/../b', join(source, 'a'));
+    const reviewed = plan(context, [await copy(join(source, 'b'), join(context.projectRoot, 'output'))], [await snapshotPath(source)]);
+    const before = await snapshotPath(root);
+    expect((await applyPlan(reviewed, { confirmed: true })).status).toBe('blocked');
+    expect(snapshotsEqual(before, await snapshotPath(root))).toBe(true);
+    expect((await readdir(context.stateHome)).length).toBe(0);
+  });
+
+  it.skipIf(sep !== '/')('applies nested output with literal POSIX backslashes without inventing path components', async () => {
+    const { context } = await sandbox();
+    const source = join(context.projectRoot, 'provided\\skills');
+    const output = join(context.projectRoot, 'approved\\skills');
+    const nested = join(output, 'nested\\assets');
+    const sourceFile = join(source, 'binary\\asset');
+    const target = join(nested, 'binary\\asset');
+    const binary = Uint8Array.from([0, 255, 128, 42]);
+    await putFile(sourceFile, binary, 0o640);
+    const sourceBefore = await snapshotPath(source);
+    const reviewed = plan(context, [await directory(output), await directory(nested), await copy(sourceFile, target, 0o640)], [sourceBefore, await snapshotPath(context.projectRoot)]);
+    expect((await applyPlan(reviewed, { confirmed: true })).status).toBe('applied');
+    expect(await bytesEqual(target, binary)).toBe(true);
+    expect((await stat(target)).mode & 0o777).toBe(0o640);
+    expect((await readdir(context.projectRoot)).includes('approved\\skills')).toBe(true);
+    expect((await readdir(output)).includes('nested\\assets')).toBe(true);
+    expect((await snapshotPath(join(context.projectRoot, 'approved'))).kind).toBe('missing');
+    expect(snapshotsEqual(sourceBefore, await snapshotPath(source))).toBe(true);
   });
 });
