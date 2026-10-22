@@ -589,25 +589,27 @@ it('retargets an owned link before removing its old referent during apply', asyn
   expect(await readFile(join(target, 'link'), 'utf8')).toBe('new referent');
 });
 
-it('retargets a dependent link before removing its obsolete referent link', async () => {
+it('removes an obsolete link before retargeting through its unchanged intermediate chain', async () => {
   sandbox = await createSandbox();
   const source = await putSkill(join(sandbox.context.projectRoot, '.claude', 'skills'), 'mixed-links', 'Mixed link update');
   await putFile(join(source, 'old.txt'), 'old referent');
-  await symlink('old.txt', join(source, 'old-target'));
-  await symlink('old-target', join(source, 'link'));
+  await symlink('old.txt', join(source, 'a'));
+  await symlink('a', join(source, 'middle'));
+  await symlink('middle', join(source, 'obsolete'));
   const target = join(sandbox.context.homeDir, '.agents', 'skills', 'mixed-links');
   await mkdir(dirname(target), { recursive: true });
   await mkdir(target, { recursive: true });
   await writeFile(join(target, 'SKILL.md'), await readFile(join(source, 'SKILL.md')));
   await putFile(join(target, 'old.txt'), 'old referent');
-  await symlink('old.txt', join(target, 'old-target'));
-  await symlink('old-target', join(target, 'link'));
+  await symlink('old.txt', join(target, 'a'));
+  await symlink('a', join(target, 'middle'));
+  await symlink('middle', join(target, 'obsolete'));
   const previous = await snapshotPath(target);
   await rm(join(source, 'old.txt'));
   await putFile(join(source, 'new.txt'), 'new referent');
-  await rm(join(source, 'old-target'));
-  await rm(join(source, 'link'));
-  await symlink('new.txt', join(source, 'link'));
+  await rm(join(source, 'a'));
+  await symlink('new.txt', join(source, 'a'));
+  await rm(join(source, 'obsolete'));
   const inventory = await inventoryFor();
   const selected = skill(inventory, 'mixed-links', source);
   const paths = await getStatePaths(sandbox.context, 'private-project');
@@ -627,17 +629,118 @@ it('retargets a dependent link before removing its obsolete referent link', asyn
   expect(plan.findings.some(finding => finding.severity === 'error'), JSON.stringify(plan.findings)).toBe(false);
   const operations = resources(plan.operations);
   const newFile = operations.findIndex(operation => operation.kind === 'write' && operation.path === join(target, 'new.txt'));
-  const retarget = operations.findIndex(operation => operation.kind === 'symlink' && operation.path === join(target, 'link'));
-  const removeOldTarget = operations.findIndex(operation => operation.kind === 'remove' && operation.path === join(target, 'old-target'));
+  const retarget = operations.findIndex(operation => operation.kind === 'symlink' && operation.path === join(target, 'a'));
+  const removeOldTarget = operations.findIndex(operation => operation.kind === 'remove' && operation.path === join(target, 'obsolete'));
   const removeOldFile = operations.findIndex(operation => operation.kind === 'remove' && operation.path === join(target, 'old.txt'));
   expect(newFile).toBeGreaterThanOrEqual(0);
   expect(retarget).toBeGreaterThan(newFile);
-  expect(removeOldTarget).toBeGreaterThan(retarget);
-  expect(removeOldFile).toBeGreaterThan(removeOldTarget);
+  expect(removeOldTarget).toBeGreaterThanOrEqual(0);
+  expect(removeOldTarget).toBeLessThan(retarget);
+  expect(removeOldFile).toBeGreaterThan(retarget);
+  expect(operations.some(operation => operation.kind === 'symlink' && operation.path === join(target, 'middle'))).toBe(false);
+  expect(plan.preconditions.some(snapshot => snapshot.path === join(target, 'middle'))).toBe(false);
+  const result = await applyPlan(plan, { confirmed: true });
+  expect(result.status, JSON.stringify(result.findings)).toBe('applied');
+  expect(await readFile(join(target, 'middle'), 'utf8')).toBe('new referent');
+  expect((await snapshotPath(join(target, 'obsolete'))).kind).toBe('missing');
+});
+
+it('allows resolution-preserving symlink spelling updates without false dependency cycles', async () => {
+  sandbox = await createSandbox();
+  const source = await putSkill(join(sandbox.context.projectRoot, '.claude', 'skills'), 'normalized-links', 'Normalized link source');
+  await putFile(join(source, 'file.txt'), 'stable referent');
+  await symlink('file.txt', join(source, 'b'));
+  await symlink('b', join(source, 'a'));
+  const target = join(sandbox.context.homeDir, '.agents', 'skills', 'normalized-links');
+  await mkdir(dirname(target), { recursive: true });
+  await mkdir(target, { recursive: true });
+  await writeFile(join(target, 'SKILL.md'), await readFile(join(source, 'SKILL.md')));
+  await putFile(join(target, 'file.txt'), 'stable referent');
+  await symlink('file.txt', join(target, 'b'));
+  await symlink('b', join(target, 'a'));
+  const previous = await snapshotPath(target);
+  await rm(join(source, 'a'));
+  await rm(join(source, 'b'));
+  await symlink('./b', join(source, 'a'));
+  await symlink('./file.txt', join(source, 'b'));
+  const inventory = await inventoryFor();
+  const selected = skill(inventory, 'normalized-links', source);
+  const paths = await getStatePaths(sandbox.context, 'private-project');
+  const authority: AuthorityConfig = { version: 1, sources: [selected.source], resourceAuthorities: { 'skill:normalized-links': selected.id } };
+  const ownership: OwnershipState = { version: 1, receipts: [{
+    slotId: fingerprintValue([resolve(target), 'skill']), path: resolve(target), kind: 'skill', key: 'normalized-links',
+    sourceId: selected.source.id, resourceId: selected.id, fingerprint: previous.digest,
+  }] };
+  await mkdir(dirname(paths.preferencePath), { recursive: true });
+  await mkdir(dirname(paths.ownershipPath), { recursive: true, mode: 0o700 });
+  await writeFile(paths.preferencePath, encodeAuthorityConfig(authority), { mode: 0o600 });
+  await writeFile(paths.ownershipPath, encodeOwnershipState(ownership), { mode: 0o600 });
+  const plan = await planSync(sandbox.context, inventory,
+    request([selected.id], [{ agentId: 'codex', placement: 'user' }], {
+      authority: { version: 1, sources: [selected.source], resourceAuthorities: { 'skill:normalized-links': selected.id } },
+    }), await loadState());
+  expect(plan.findings.some(finding => finding.code === 'SYMLINK_DEPENDENCY_CYCLE')).toBe(false);
+  expect(plan.findings.some(finding => finding.severity === 'error'), JSON.stringify(plan.findings)).toBe(false);
+  const links = resources(plan.operations).filter(operation => operation.kind === 'symlink');
+  const writeB = links.findIndex(operation => operation.path === join(target, 'b'));
+  const writeA = links.findIndex(operation => operation.path === join(target, 'a'));
+  expect(writeB).toBeGreaterThanOrEqual(0);
+  expect(writeA).toBeGreaterThan(writeB);
+  expect((await applyPlan(plan, { confirmed: true })).status).toBe('applied');
+  expect(await readlink(join(target, 'a'))).toBe('./b');
+  expect(await readFile(join(target, 'a'), 'utf8')).toBe('stable referent');
+});
+
+it('retargets a link before removing the symlink that was its old target', async () => {
+  sandbox = await createSandbox();
+  const source = await putSkill(join(sandbox.context.projectRoot, '.claude', 'skills'), 'old-target-link', 'Old target link update');
+  await putFile(join(source, 'old.txt'), 'old referent');
+  await symlink('old.txt', join(source, 'old-target'));
+  await symlink('old-target', join(source, 'link'));
+  const target = join(sandbox.context.homeDir, '.agents', 'skills', 'old-target-link');
+  await mkdir(dirname(target), { recursive: true });
+  await mkdir(target, { recursive: true });
+  await writeFile(join(target, 'SKILL.md'), await readFile(join(source, 'SKILL.md')));
+  await putFile(join(target, 'old.txt'), 'old referent');
+  await symlink('old.txt', join(target, 'old-target'));
+  await symlink('old-target', join(target, 'link'));
+  const previous = await snapshotPath(target);
+  await rm(join(source, 'old.txt'));
+  await putFile(join(source, 'new.txt'), 'new referent');
+  await rm(join(source, 'old-target'));
+  await rm(join(source, 'link'));
+  await symlink('new.txt', join(source, 'link'));
+  const inventory = await inventoryFor();
+  const selected = skill(inventory, 'old-target-link', source);
+  const paths = await getStatePaths(sandbox.context, 'private-project');
+  const authority: AuthorityConfig = { version: 1, sources: [selected.source], resourceAuthorities: { 'skill:old-target-link': selected.id } };
+  const ownership: OwnershipState = { version: 1, receipts: [{
+    slotId: fingerprintValue([resolve(target), 'skill']), path: resolve(target), kind: 'skill', key: 'old-target-link',
+    sourceId: selected.source.id, resourceId: selected.id, fingerprint: previous.digest,
+  }] };
+  await mkdir(dirname(paths.preferencePath), { recursive: true });
+  await mkdir(dirname(paths.ownershipPath), { recursive: true, mode: 0o700 });
+  await writeFile(paths.preferencePath, encodeAuthorityConfig(authority), { mode: 0o600 });
+  await writeFile(paths.ownershipPath, encodeOwnershipState(ownership), { mode: 0o600 });
+  const plan = await planSync(sandbox.context, inventory,
+    request([selected.id], [{ agentId: 'codex', placement: 'user' }], {
+      authority: { version: 1, sources: [selected.source], resourceAuthorities: { 'skill:old-target-link': selected.id } },
+    }), await loadState());
+  expect(plan.findings.some(finding => finding.severity === 'error'), JSON.stringify(plan.findings)).toBe(false);
+  const operations = resources(plan.operations);
+  const newFile = operations.findIndex(operation => operation.kind === 'write' && operation.path === join(target, 'new.txt'));
+  const retarget = operations.findIndex(operation => operation.kind === 'symlink' && operation.path === join(target, 'link'));
+  const removeTarget = operations.findIndex(operation => operation.kind === 'remove' && operation.path === join(target, 'old-target'));
+  const removeFile = operations.findIndex(operation => operation.kind === 'remove' && operation.path === join(target, 'old.txt'));
+  expect(newFile).toBeGreaterThanOrEqual(0);
+  expect(retarget).toBeGreaterThan(newFile);
+  expect(removeTarget).toBeGreaterThan(retarget);
+  expect(removeFile).toBeGreaterThan(removeTarget);
   const result = await applyPlan(plan, { confirmed: true });
   expect(result.status, JSON.stringify(result.findings)).toBe('applied');
   expect(await readFile(join(target, 'link'), 'utf8')).toBe('new referent');
   expect((await snapshotPath(join(target, 'old-target'))).kind).toBe('missing');
+  expect((await snapshotPath(join(target, 'old.txt'))).kind).toBe('missing');
 });
 
 it('removes an obsolete symlink before retargeting its intermediate link during apply', async () => {

@@ -208,10 +208,45 @@ function compareOperations(a: Operation, b: Operation): number {
   if (depth !== 0) return aRemove ? -depth : depth;
   return a.path.localeCompare(b.path) || a.kind.localeCompare(b.kind);
 }
-function orderSymlinkChanges(operations: readonly Operation[], findings: Finding[]): Operation[] {
+function resolveSymlinkPath(input: string, links: ReadonlyMap<string, string>): { path: string; chain: string[]; cycle: boolean } {
+  let current = resolve(input);
+  const chain: string[] = [];
+  const visited = new Set<string>();
+  for (;;) {
+    let cursor = current;
+    const suffix: string[] = [];
+    while (!links.has(cursor)) {
+      const parent = dirname(cursor);
+      if (parent === cursor) return { path: current, chain, cycle: false };
+      suffix.unshift(basename(cursor));
+      cursor = parent;
+    }
+    if (visited.has(cursor)) return { path: current, chain, cycle: true };
+    visited.add(cursor);
+    chain.push(cursor);
+    current = resolve(dirname(cursor), links.get(cursor)!, ...suffix);
+  }
+}
+
+function orderSymlinkChanges(operations: readonly Operation[], preconditions: readonly PathSnapshot[], findings: Finding[]): Operation[] {
   const links = operations.filter(operation => operation.kind === 'symlink'
     || operation.kind === 'remove' && operation.expected.kind === 'symlink');
   const byPath = new Map(links.map(operation => [resolve(operation.path), operation]));
+  const currentLinks = new Map<string, string>();
+  for (const snapshot of preconditions) {
+    if (snapshot.kind !== 'directory') continue;
+    for (const entry of snapshot.entries) if (entry.kind === 'symlink' && entry.linkTarget !== undefined) {
+      const path = entry.relativePath ? resolve(snapshot.path, ...entry.relativePath.split('/')) : resolve(snapshot.path);
+      currentLinks.set(path, entry.linkTarget);
+    }
+  }
+  for (const operation of links) if (operation.expected.kind === 'symlink') currentLinks.set(resolve(operation.path), operation.expected.linkTarget ?? '');
+  const finalLinks = new Map(currentLinks);
+  for (const operation of links) {
+    const path = resolve(operation.path);
+    if (operation.kind === 'symlink') finalLinks.set(path, operation.target);
+    else finalLinks.delete(path);
+  }
   const edges = new Map([...byPath.keys()].map(path => [path, new Set<string>()]));
   const indegree = new Map([...byPath.keys()].map(path => [path, 0]));
   const addEdge = (before: string, after: string): void => {
@@ -232,7 +267,14 @@ function orderSymlinkChanges(operations: readonly Operation[], findings: Finding
     }
     if (operation.expected.kind === 'symlink') {
       const oldTarget = resolve(dirname(path), operation.expected.linkTarget ?? '');
-      for (const candidate of byPath.keys()) if (isWithin(candidate, oldTarget)) addEdge(path, candidate);
+      const before = resolveSymlinkPath(oldTarget, currentLinks);
+      const after = resolveSymlinkPath(oldTarget, finalLinks);
+      const expectedReferent = resolve(operation.expected.resolvedPath);
+      if (before.cycle || after.cycle || before.path !== expectedReferent) {
+        findings.push(issue('SYMLINK_DEPENDENCY_UNRESOLVED', 'A planned link no longer resolves through its reviewed native chain.', path));
+      } else if (after.path !== expectedReferent) {
+        for (const candidate of before.chain) if (candidate !== path && byPath.has(candidate)) addEdge(path, candidate);
+      }
     }
   }
   const ready = [...byPath.keys()].filter(path => indegree.get(path) === 0).sort();
@@ -254,12 +296,12 @@ function orderSymlinkChanges(operations: readonly Operation[], findings: Finding
   return ordered;
 }
 
-function orderOperations(operations: readonly Operation[], findings: Finding[]): Operation[] {
+function orderOperations(operations: readonly Operation[], preconditions: readonly PathSnapshot[], findings: Finding[]): Operation[] {
   const result: Operation[] = [];
   for (const purpose of ['resource', 'state'] as const) {
     const group = operations.filter(operation => operation.purpose === purpose);
     result.push(...group.filter(operation => operation.kind !== 'symlink' && operation.kind !== 'remove').sort(compareOperations));
-    result.push(...orderSymlinkChanges(group, findings));
+    result.push(...orderSymlinkChanges(group, preconditions, findings));
     result.push(...group.filter(operation => operation.kind === 'remove' && operation.expected.kind !== 'symlink').sort(compareOperations));
   }
   return result;
@@ -933,7 +975,7 @@ export async function planSync(
     }
   }
 
-  const operations = orderOperations(builder.operations, builder.findings);
+  const operations = orderOperations(builder.operations, builder.preconditions, builder.findings);
   const preconditions = uniqueSnapshots(builder.preconditions, builder.findings);
   const summary: PlanSummary = {
     authorities: [...new Map(selected.map(resource => [resource.source.id, resource.source])).values()].sort((a, b) => a.id.localeCompare(b.id)),
