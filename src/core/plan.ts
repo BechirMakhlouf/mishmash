@@ -208,54 +208,48 @@ function compareOperations(a: Operation, b: Operation): number {
   if (depth !== 0) return aRemove ? -depth : depth;
   return a.path.localeCompare(b.path) || a.kind.localeCompare(b.kind);
 }
-function orderSymlinkWrites(links: readonly Extract<Operation, { kind: 'symlink' }>[], findings: Finding[]): Operation[] {
-  const pending = new Map(links.map(operation => [resolve(operation.path), operation]));
-  const ordered: Operation[] = [];
-  while (pending.size) {
-    const ready = [...pending.entries()].filter(([, operation]) => {
-      const target = resolve(dirname(operation.path), operation.target);
-      return ![...pending.keys()].some(path => isWithin(path, target));
-    }).sort(([a], [b]) => a.localeCompare(b));
-    if (!ready.length) {
-      const path = [...pending.keys()].sort()[0]!;
-      findings.push(issue('SKILL_LINK_CYCLE', 'Planned skill links contain a dependency cycle.', path));
-      ordered.push(...[...pending.values()].sort((a, b) => a.path.localeCompare(b.path)));
-      break;
-    }
-    for (const [path, operation] of ready) {
-      ordered.push(operation);
-      pending.delete(path);
-    }
-  }
-  return ordered;
-}
-
-function orderSymlinkRemovals(removals: readonly Extract<Operation, { kind: 'remove' }>[], findings: Finding[]): Operation[] {
-  const paths = new Set(removals.map(operation => resolve(operation.path)));
-  const edges = new Map<string, string[]>();
-  const indegree = new Map([...paths].map(path => [path, 0]));
-  for (const operation of removals) {
+function orderSymlinkChanges(operations: readonly Operation[], findings: Finding[]): Operation[] {
+  const links = operations.filter(operation => operation.kind === 'symlink'
+    || operation.kind === 'remove' && operation.expected.kind === 'symlink');
+  const byPath = new Map(links.map(operation => [resolve(operation.path), operation]));
+  const edges = new Map([...byPath.keys()].map(path => [path, new Set<string>()]));
+  const indegree = new Map([...byPath.keys()].map(path => [path, 0]));
+  const addEdge = (before: string, after: string): void => {
+    const targets = edges.get(before);
+    if (!targets || !byPath.has(after) || targets.has(after)) return;
+    targets.add(after);
+    indegree.set(after, indegree.get(after)! + 1);
+  };
+  for (const operation of links) {
     const path = resolve(operation.path);
-    const target = resolve(dirname(path), operation.expected.linkTarget ?? '');
-    const dependencies = [...paths].filter(candidate => isWithin(candidate, target));
-    edges.set(path, dependencies);
-    for (const dependency of dependencies) indegree.set(dependency, (indegree.get(dependency) ?? 0) + 1);
+    if (operation.kind === 'symlink') {
+      const target = resolve(dirname(path), operation.target);
+      for (const [candidate, dependency] of byPath) {
+        if (dependency.kind === 'remove' && isWithin(candidate, target)) {
+          findings.push(issue('SYMLINK_TARGET_REMOVED', 'A planned link targets an obsolete symlink destination.', path));
+        } else if (dependency.kind === 'symlink' && isWithin(candidate, target)) addEdge(candidate, path);
+      }
+    }
+    if (operation.expected.kind === 'symlink') {
+      const oldTarget = resolve(dirname(path), operation.expected.linkTarget ?? '');
+      for (const candidate of byPath.keys()) if (isWithin(candidate, oldTarget)) addEdge(path, candidate);
+    }
   }
-  const ready = [...paths].filter(path => indegree.get(path) === 0).sort();
+  const ready = [...byPath.keys()].filter(path => indegree.get(path) === 0).sort();
   const ordered: Operation[] = [];
   while (ready.length) {
     const path = ready.shift()!;
-    ordered.push(removals.find(operation => resolve(operation.path) === path)!);
-    for (const dependency of edges.get(path) ?? []) {
+    ordered.push(byPath.get(path)!);
+    for (const dependency of edges.get(path)!) {
       const count = indegree.get(dependency)! - 1;
       indegree.set(dependency, count);
       if (count === 0) { ready.push(dependency); ready.sort(); }
     }
   }
-  if (ordered.length !== removals.length) {
-    const path = [...paths].filter(candidate => !ordered.some(operation => resolve(operation.path) === candidate)).sort()[0]!;
-    findings.push(issue('SYMLINK_REMOVAL_CYCLE', 'Obsolete skill links contain a removal dependency cycle.', path));
-    ordered.push(...removals.filter(operation => !ordered.includes(operation)).sort((a, b) => a.path.localeCompare(b.path)));
+  if (ordered.length !== links.length) {
+    const path = [...byPath.keys()].filter(candidate => !ordered.some(operation => resolve(operation.path) === candidate)).sort()[0]!;
+    findings.push(issue('SYMLINK_DEPENDENCY_CYCLE', 'Planned symlink changes contain a dependency cycle.', path));
+    ordered.push(...links.filter(operation => !ordered.includes(operation)).sort((a, b) => a.path.localeCompare(b.path)));
   }
   return ordered;
 }
@@ -265,10 +259,8 @@ function orderOperations(operations: readonly Operation[], findings: Finding[]):
   for (const purpose of ['resource', 'state'] as const) {
     const group = operations.filter(operation => operation.purpose === purpose);
     result.push(...group.filter(operation => operation.kind !== 'symlink' && operation.kind !== 'remove').sort(compareOperations));
-    const removals = group.filter((operation): operation is Extract<Operation, { kind: 'remove' }> => operation.kind === 'remove');
-    result.push(...orderSymlinkRemovals(removals.filter(operation => operation.expected.kind === 'symlink'), findings));
-    result.push(...orderSymlinkWrites(group.filter((operation): operation is Extract<Operation, { kind: 'symlink' }> => operation.kind === 'symlink'), findings));
-    result.push(...removals.filter(operation => operation.expected.kind !== 'symlink').sort(compareOperations));
+    result.push(...orderSymlinkChanges(group, findings));
+    result.push(...group.filter(operation => operation.kind === 'remove' && operation.expected.kind !== 'symlink').sort(compareOperations));
   }
   return result;
 }
