@@ -7,10 +7,15 @@ import { editJsonDocument, isRecord, readJsonDocument } from '../resources/jsonc
 import { discoverSkills, resourceId, sourceRef } from '../resources/skills.js';
 
 const id = 'claude-code';
+const reservedMcpNames = new Set(['workspace', 'claude-in-chrome', 'computer-use', 'Claude Preview', 'Claude Browser']);
 const own = (value: Record<string, unknown>, key: string): boolean => Object.hasOwn(value, key);
 const strings = (value: unknown): value is string[] => Array.isArray(value) && value.every(item => typeof item === 'string');
 const stringMap = (value: unknown): value is Record<string, string> => isRecord(value) && Object.values(value).every(item => typeof item === 'string');
 function problem(path: string, code: string): Finding { return filesystemFinding(path, code); }
+function reservedNameFinding(path: string): Finding {
+  return { severity: 'error', code: 'RESERVED_MCP_NAME', path, message: 'Claude Code skips this reserved MCP server name.',
+    remediation: 'Rename the source registration before synchronizing.' };
+}
 
 function definition(value: unknown): McpDefinition | undefined {
   if (!isRecord(value)) return;
@@ -22,9 +27,12 @@ function definition(value: unknown): McpDefinition | undefined {
     || own(value, 'headers') && !stringMap(value.headers) || own(value, 'command') && typeof value.command !== 'string'
     || own(value, 'url') && typeof value.url !== 'string') return;
   const supported = transport === 'stdio' ? ['type', 'command', 'args', 'env'] : ['type', 'url', 'headers'];
+  const unsupportedFields = Object.keys(value).filter(key => !supported.includes(key));
+  if (transport === 'http') unsupportedFields.push('transport-auto-detection');
+  if (/\$\{/.test(JSON.stringify(value))) unsupportedFields.push('environment-expansion');
   return {
     transport, nativeAgent: id, native: value,
-    unsupportedFields: Object.keys(value).filter(key => !supported.includes(key)),
+    unsupportedFields,
     ...(transport === 'stdio' ? {
       command: value.command as string,
       ...(strings(value.args) ? { args: value.args } : {}),
@@ -61,10 +69,10 @@ async function nativePath(context: Context, placement: Placement): Promise<strin
 function converted(resource: McpResource): Record<string, unknown> | undefined {
   const value = resource.definition;
   if (value.nativeAgent === id) return definition(value.native) ? value.native : undefined;
-  if (value.unsupportedFields.length || value.cwd !== undefined) return;
+  if (value.unsupportedFields.length || value.cwd !== undefined || value.transport === 'http') return;
   // Gemini also expands bare $VAR and Windows %VAR%; Claude does not. Never resolve them here.
   if (value.nativeAgent === 'gemini-cli' && /\$(?!\{)[A-Za-z_]|%[A-Za-z_][A-Za-z_0-9]*%/.test(JSON.stringify(value.native))) return;
-  if (value.nativeAgent !== 'gemini-cli' && /\$\{/.test(JSON.stringify(value.native))) return;
+  if (/\$\{/.test(JSON.stringify(value.native))) return;
   const result: Record<string, unknown> = { type: value.transport };
   if (value.transport === 'stdio') {
     if (value.url !== undefined || value.headers !== undefined) return;
@@ -128,6 +136,7 @@ export const claudeCodeAdapter: NativeAdapter = {
         const actualSource = sourceRef(id, document.snapshot.resolvedPath, source.scope, source.visibility, source.label);
         sources.push(actualSource);
         for (const [name, native] of Object.entries(servers)) {
+          if (reservedMcpNames.has(name)) { findings.push(reservedNameFinding(source.path)); continue; }
           const parsed = definition(native);
           if (!parsed || !/^[A-Za-z0-9_-]+$/.test(name)) { findings.push(problem(source.path, 'INVALID_MCP_DEFINITION')); continue; }
           const locator = JSON.stringify([...path, name]);
@@ -151,6 +160,7 @@ export const claudeCodeAdapter: NativeAdapter = {
       const targets: PreparedMcpTarget[] = [];
       const keys = new Set<string>();
       for (const resource of resources) {
+        if (reservedMcpNames.has(resource.name)) { findings.push(reservedNameFinding(source.path)); continue; }
         if (resource.source.visibility === 'private' && (placement === 'project' || resource.source.scope === 'project' && placement === 'user')) {
           findings.push(problem(source.path, 'PRIVATE_RESOURCE_SCOPE')); continue;
         }

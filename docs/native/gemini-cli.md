@@ -6,6 +6,7 @@ Verified on 2026-10-22 against these primary sources:
 - [Configuration: settings files](https://geminicli.com/docs/reference/configuration/#settings-files).
 - [MCP configuration properties](https://geminicli.com/docs/tools/mcp-server/#configuration-properties).
 - Current upstream [`MCPServerConfig`](https://github.com/google-gemini/gemini-cli/blob/main/packages/core/src/config/config.ts) and [transport selection](https://github.com/google-gemini/gemini-cli/blob/main/packages/core/src/tools/mcp-client.ts).
+- Gemini's [environment resolver](https://github.com/google-gemini/gemini-cli/blob/main/packages/cli/src/utils/envVarResolver.ts), contrasted with Claude's [credential-variable suppression](https://code.claude.com/docs/en/mcp#credential-variables-that-read-as-empty) and [HTTP-to-SSE fallback](https://code.claude.com/docs/en/mcp#option-2-add-a-remote-sse-server).
 
 ## Locations and scope
 
@@ -31,12 +32,12 @@ The public MCP guide documents `command` for stdio, `httpUrl` for Streamable HTT
 
 - `httpUrl` and explicit `url`/`type` entries have known transport semantics.
 - Untyped `url` entries remain discoverable and are preserved for same-agent synchronization, with `transport-auto-detection` listed as an unsupported conversion semantic. The common model's `http` projection is not a promise of fixed transport, and cross-agent conversion is blocked.
-- HTTP output uses the still-supported and documented `httpUrl`; SSE output uses `url` with explicit `type: "sse"` to avoid changing transport under current upstream behavior.
+- Compatible fixed-HTTP output uses the still-supported and documented `httpUrl`; SSE output uses `url` with explicit `type: "sse"` to avoid changing transport under current upstream behavior. Claude HTTP and its `streamable-http` alias are not fixed HTTP: Claude 2.1.265+ falls back to SSE, so their cross-agent conversion is blocked. The adapter does not guess that Gemini's auto-detection has exactly equivalent fallback behavior. Native Claude HTTP entries remain preserved by their own adapter.
 - Conflicting endpoint fields, native `tcp`/unknown execution fields, trust, timeouts, tool filters, OAuth/provider configuration and other unrepresented semantics are not silently dropped during conversion. Unsupported transports produce safe findings.
 
 Stdio's common fields are `command`, optional `args`, string-valued `env` and `cwd`. Remote transports support a string endpoint and string-valued `headers`. A complete selected Gemini native object is preserved on compatible same-agent edits, including provider/helper-related settings; no executable, helper, credential or authentication flow is invoked. Native `trust: true` bypasses tool confirmations, so any changed selected entry carrying it is blocked with `MCP_TRUST_ESCALATION` rather than granting trust or silently dropping the field. An existing byte-equivalent native trusted entry remains a no-op. Unrelated destination trust flags remain untouched. Cross-agent conversions neither add trust flags nor resolve environment expressions. Native expressions remain literal configuration values.
 
-Cross-agent inputs containing bare `$VAR` or `%VAR%` forms block rather than turn another client's literal into Gemini interpolation. `${VAR}` references are accepted only from the verified Claude/Gemini pair; unverified source-format interpolation semantics also block.
+All cross-agent inputs containing `${VAR}`, `${VAR:-default}`, bare `$VAR` or `%VAR%` forms block rather than change interpolation or credential behavior. In particular, Claude substitutes empty strings for covered credentials in remote URL/header references, even with a default, while Gemini's resolver reads environment values. The adapter conservatively rejects every Claude braced variable rather than expose a credential or attempt environment/secret resolution. Same-agent Gemini references remain literal, unchanged configuration data. Findings contain no expressions, credential values, URLs or configuration bodies.
 
 Preparation edits only selected `mcpServers` keys using the shared JSONC reader/editor, preserving unchecked registrations, unrelated settings and their comments. It blocks malformed/unsafe documents and emits findings without raw configuration or credential values. Existing global MCP allow/exclude/trust settings are not rewritten, and discovery does not claim a listed registration is active.
 

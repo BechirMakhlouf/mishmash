@@ -176,6 +176,27 @@ describe('Claude Code native adapter', () => {
     expect(result.findings.some(finding => finding.code === 'PRIVATE_RESOURCE_SCOPE')).toBe(true);
   });
 
+  it.each(['workspace', 'claude-in-chrome', 'computer-use', 'Claude Preview', 'Claude Browser'])('rejects reserved MCP name %s during discovery and before any target intent', async name => {
+    const token = randomUUID();
+    const native = { command: 'never-run', env: { TOKEN: token } };
+    await putFile(join(sandbox.context.projectRoot, '.gemini', 'settings.json'), JSON.stringify({ mcpServers: { [name]: native } }));
+    const selected = await mcp(name, geminiCliAdapter);
+    await putFile(join(sandbox.context.projectRoot, '.mcp.json'), JSON.stringify({ mcpServers: { [name]: native, untouched: { command: 'keep' } } }));
+    const before = await snapshotPath(sandbox.root);
+    const discovery = await adapter.discover(sandbox.context);
+    expect(discovery.resources.some(resource => resource.kind === 'mcp' && resource.name === name)).toBe(false);
+    expect(discovery.findings.some(finding => finding.code === 'RESERVED_MCP_NAME' && finding.severity === 'error')).toBe(true);
+    expect(JSON.stringify(discovery.findings).includes(token)).toBe(false);
+    for (const placement of ['project', 'private-project', 'user'] as const) {
+      const result = await adapter.prepareMcpEdit(sandbox.context, placement, [selected]);
+      expect(result.files.length).toBe(0);
+      expect(result.targets.length).toBe(0);
+      expect(result.findings.some(finding => finding.code === 'RESERVED_MCP_NAME' && finding.severity === 'error')).toBe(true);
+      expect(JSON.stringify(result.findings).includes(token)).toBe(false);
+    }
+    expect(snapshotsEqual(before, await snapshotPath(sandbox.root))).toBe(true);
+  });
+
   it.each([
     '{"mcpServers": {"bad": {"command": "',
     JSON.stringify({ mcpServers: [] }),
@@ -212,7 +233,7 @@ describe('Claude Code native adapter', () => {
     expect(result.findings.some(finding => finding.code === 'UNSAFE_CONFIG_PATH')).toBe(true);
   });
 
-  it('converts only supported explicit Gemini fields and blocks cwd, native fields, expansion and auto transport', async () => {
+  it('converts only explicit SSE/stdio Gemini fields and blocks fixed HTTP, cwd, native fields, expansion and auto transport', async () => {
     const path = join(sandbox.context.projectRoot, '.gemini', 'settings.json');
     await putFile(path, JSON.stringify({ mcpServers: {
       http: { httpUrl: 'https://example.invalid/mcp', headers: { Accept: 'application/json' } },
@@ -225,7 +246,7 @@ describe('Claude Code native adapter', () => {
       expansion: { command: 'not-run', env: { TOKEN: '$UNRESOLVED' } },
       auto: { url: 'https://example.invalid/auto' },
     } }));
-    for (const name of ['http', 'sse', 'stdio']) {
+    for (const name of ['sse', 'stdio']) {
       const selected = await mcp(name, geminiCliAdapter);
       const result = await adapter.prepareMcpEdit(sandbox.context, 'project', [selected]);
       expect(result.findings.length).toBe(0);
@@ -233,7 +254,7 @@ describe('Claude Code native adapter', () => {
       expect(native.type).toBe(name);
       expect(result.targets[0]!.afterFingerprint).toBe(fingerprintValue(native));
     }
-    for (const name of ['cwd', 'trust', 'timeout', 'tools', 'expansion', 'auto']) {
+    for (const name of ['http', 'cwd', 'trust', 'timeout', 'tools', 'expansion', 'auto']) {
       const result = await adapter.prepareMcpEdit(sandbox.context, 'project', [await mcp(name, geminiCliAdapter)]);
       expect(result.files.length).toBe(0);
       expect(result.findings.some(finding => finding.code === 'UNSUPPORTED_MCP_CONVERSION')).toBe(true);

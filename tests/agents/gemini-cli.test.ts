@@ -154,9 +154,8 @@ describe('Gemini CLI native adapter', () => {
     expect(snapshotsEqual(before, await snapshotPath(sandbox.root))).toBe(true);
   });
 
-  it('converts compatible Claude stdio, HTTP alias and SSE entries without granting trust', async () => {
+  it('converts compatible Claude stdio and explicit SSE entries without granting trust', async () => {
     const values = { stdio: { command: 'never', args: ['one'], env: { VALUE: 'literal' } },
-      http: { type: 'streamable-http', url: 'https://example.invalid/mcp', headers: { Accept: 'application/json' } },
       sse: { type: 'sse', url: 'https://example.invalid/events' } };
     await putFile(join(sandbox.context.projectRoot, '.mcp.json'), JSON.stringify({ mcpServers: values }));
     const resources = await Promise.all(Object.keys(values).map(name => mcp(name, claudeCodeAdapter)));
@@ -168,18 +167,17 @@ describe('Gemini CLI native adapter', () => {
     const output = decoded(result.files[0]!.bytes).mcpServers;
     expect(output.stdio.command).toBe('never');
     expect(output.stdio.args).toEqual(['one']);
-    expect(output.http.httpUrl).toBe('https://example.invalid/mcp');
     expect(output.sse.url).toBe('https://example.invalid/events');
     expect(output.sse.type).toBe('sse');
     expect(Object.values(output).every(value => typeof value === 'object' && value !== null && !Object.hasOwn(value, 'trust'))).toBe(true);
-    expect(result.targets.length).toBe(3);
+    expect(result.targets.length).toBe(2);
     expect(result.targets.every(target => target.beforeFingerprint === undefined)).toBe(true);
     expect(snapshotsEqual(before, await snapshotPath(sandbox.root))).toBe(true);
   });
 
   it.each(['headersHelper', 'timeout', 'alwaysLoad', 'oauth', 'futureExecution'])('blocks lossy Claude %s conversion but preserves it natively', async field => {
     const token = randomUUID();
-    await putFile(join(sandbox.context.projectRoot, '.mcp.json'), JSON.stringify({ mcpServers: { selected: { type: 'http', url: 'https://example.invalid/mcp', [field]: token } } }));
+    await putFile(join(sandbox.context.projectRoot, '.mcp.json'), JSON.stringify({ mcpServers: { selected: { type: 'sse', url: 'https://example.invalid/mcp', [field]: token } } }));
     const selected = await mcp('selected', claudeCodeAdapter);
     const result = await adapter.prepareMcpEdit(sandbox.context, 'project', [selected]);
     expect(result.files.length).toBe(0);
@@ -198,6 +196,64 @@ describe('Gemini CLI native adapter', () => {
     expect(result.findings.some(finding => finding.code === 'UNSUPPORTED_MCP_CONVERSION')).toBe(true);
   });
 
+  it.each(['command', 'args', 'env', 'url', 'headers'])('blocks every Claude braced variable in %s without resolving or exposing it', async field => {
+    const token = randomUUID();
+    const names = ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'AWS_BEARER_TOKEN_BEDROCK', 'HTTPS_PROXY', 'NPM_TOKEN', 'ORDINARY_VARIABLE'];
+    for (const name of names) {
+      for (const fallback of ['', `:-${token}`]) {
+        const expression = '${' + name + fallback + '}';
+        const native: Record<string, unknown> = field === 'url' || field === 'headers'
+          ? { type: 'sse', url: 'https://example.invalid/mcp', headers: { Marker: token } }
+          : { command: 'never', env: { MARKER: token } };
+        if (field === 'args') native.args = [expression];
+        else if (field === 'env') native.env = { VALUE: expression, MARKER: token };
+        else if (field === 'url') native.url = `https://example.invalid/${expression}/${token}`;
+        else if (field === 'headers') native.headers = { Authorization: `Bearer ${expression}`, Marker: token };
+        else native.command = expression;
+        await putFile(join(sandbox.context.projectRoot, '.mcp.json'), JSON.stringify({ mcpServers: { selected: native } }));
+        const selected = await mcp('selected', claudeCodeAdapter);
+        const before = await snapshotPath(sandbox.root);
+        for (const placement of ['project', 'user'] as const) {
+          const result = await adapter.prepareMcpEdit(sandbox.context, placement, [selected]);
+          expect(result.files.length).toBe(0);
+          expect(result.targets.length).toBe(0);
+          expect(result.findings.some(finding => finding.code === 'UNSUPPORTED_MCP_CONVERSION' && finding.severity === 'error')).toBe(true);
+          const diagnostics = JSON.stringify(result.findings);
+          expect(diagnostics.includes(token) || diagnostics.includes(expression) || diagnostics.includes(name)).toBe(false);
+        }
+        const nativeCopy = await claudeCodeAdapter.prepareMcpEdit(sandbox.context, 'user', [selected]);
+        expect(nativeCopy.findings.length).toBe(0);
+        expect(nativeCopy.files.length).toBe(1);
+        expect(fingerprintValue(decoded(nativeCopy.files[0]!.bytes).mcpServers.selected) === fingerprintValue(native)).toBe(true);
+        expect(snapshotsEqual(before, await snapshotPath(sandbox.root))).toBe(true);
+      }
+    }
+  });
+
+  it.each(['http', 'streamable-http'])('blocks Claude %s fallback conversion while preserving the native registration', async type => {
+    const token = randomUUID();
+    const native = { type, url: `https://example.invalid/${token}`, headers: { Authorization: token } };
+    await putFile(join(sandbox.context.projectRoot, '.mcp.json'), JSON.stringify({ mcpServers: { selected: native } }));
+    const selected = await mcp('selected', claudeCodeAdapter);
+    expect(selected.definition.unsupportedFields.includes('transport-auto-detection')).toBe(true);
+    const before = await snapshotPath(sandbox.root);
+    for (const placement of ['project', 'user'] as const) {
+      const result = await adapter.prepareMcpEdit(sandbox.context, placement, [selected]);
+      expect(result.files.length).toBe(0);
+      expect(result.targets.length).toBe(0);
+      expect(result.findings.some(finding => finding.code === 'UNSUPPORTED_MCP_CONVERSION' && finding.severity === 'error')).toBe(true);
+      expect(JSON.stringify(result.findings).includes(token)).toBe(false);
+    }
+    const unchanged = await claudeCodeAdapter.prepareMcpEdit(sandbox.context, 'project', [selected]);
+    expect(unchanged.files.length).toBe(0);
+    expect(unchanged.targets.length).toBe(1);
+    const nativeCopy = await claudeCodeAdapter.prepareMcpEdit(sandbox.context, 'user', [selected]);
+    expect(nativeCopy.findings.length).toBe(0);
+    expect(nativeCopy.files.length).toBe(1);
+    expect(fingerprintValue(decoded(nativeCopy.files[0]!.bytes).mcpServers.selected) === fingerprintValue(native)).toBe(true);
+    expect(snapshotsEqual(before, await snapshotPath(sandbox.root))).toBe(true);
+  });
+
   it('distinguishes explicit current native transport forms and blocks ambiguous/excess source fields on conversion', async () => {
     await putFile(join(sandbox.context.projectRoot, '.gemini', 'settings.json'), JSON.stringify({ mcpServers: {
       typedHttp: { type: 'http', url: 'https://example.invalid/mcp' },
@@ -207,14 +263,14 @@ describe('Gemini CLI native adapter', () => {
       conflicting: { httpUrl: 'https://example.invalid/http', url: 'https://example.invalid/sse' },
       extras: { command: 'not-run', unknownExecutionFlag: true },
     } }));
-    for (const [name, transport] of [['typedHttp', 'http'], ['typedSse', 'sse'], ['legacyHttp', 'http']] as const) {
+    for (const [name, transport] of [['typedSse', 'sse']] as const) {
       const selected = await mcp(name);
       expect(selected.definition.transport).toBe(transport);
       const result = await claudeCodeAdapter.prepareMcpEdit(sandbox.context, 'project', [selected]);
       expect(result.findings.length).toBe(0);
       expect(decoded(result.files[0]!.bytes).mcpServers[name].type).toBe(transport);
     }
-    for (const name of ['auto', 'conflicting', 'extras']) {
+    for (const name of ['typedHttp', 'legacyHttp', 'auto', 'conflicting', 'extras']) {
       const selected = await mcp(name);
       expect((await adapter.prepareMcpEdit(sandbox.context, 'user', [selected])).files.length).toBe(1);
       const cross = await claudeCodeAdapter.prepareMcpEdit(sandbox.context, 'project', [selected]);

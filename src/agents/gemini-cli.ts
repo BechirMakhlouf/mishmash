@@ -57,8 +57,9 @@ function converted(resource: McpResource): Record<string, unknown> | undefined {
   const value = resource.definition;
   if (value.nativeAgent === id) return definition(value.native) ? value.native : undefined;
   if (value.unsupportedFields.length) return;
-  if (/\$(?!\{)[A-Za-z_]|%[A-Za-z_][A-Za-z_0-9]*%/.test(JSON.stringify(value.native))) return;
-  if (value.nativeAgent !== 'claude-code' && /\$\{/.test(JSON.stringify(value.native))) return;
+  // Claude suppresses credential variables in remote URLs/headers; Gemini would expand them.
+  // No cross-agent interpolation is equivalent enough to copy without resolving secrets.
+  if (/\$(?:\{|[A-Za-z_])|%[A-Za-z_][A-Za-z_0-9]*%/.test(JSON.stringify(value.native))) return;
   const result: Record<string, unknown> = {};
   if (value.transport === 'stdio') {
     if (value.url !== undefined || value.headers !== undefined) return;
