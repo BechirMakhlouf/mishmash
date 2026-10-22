@@ -1,5 +1,5 @@
 import { lstat, readFile, realpath, stat } from 'node:fs/promises';
-import { basename, dirname, isAbsolute, relative, resolve, sep } from 'node:path';
+import { basename, dirname, isAbsolute, parse, relative, resolve, sep } from 'node:path';
 import type { NativeAdapter, PreparedFileEdit, PreparedMcpTarget } from '../agents/contract.js';
 import { nativeAdapters } from '../agents/index.js';
 import type {
@@ -208,26 +208,29 @@ function compareOperations(a: Operation, b: Operation): number {
   if (depth !== 0) return aRemove ? -depth : depth;
   return a.path.localeCompare(b.path) || a.kind.localeCompare(b.kind);
 }
-function resolveSymlinkPath(input: string, links: ReadonlyMap<string, string>): { path: string; chain: string[]; cycle: boolean } {
-  let current = resolve(input);
+function resolveSymlinkPath(base: string, input: string, links: ReadonlyMap<string, string>): { path: string; chain: string[]; cycle: boolean } {
+  const basePath = resolve(base);
+  const root = parse(basePath).root;
+  const components = relative(root, basePath).split(sep).filter(Boolean);
+  const pending = input.split(/[\\/]/);
   const chain: string[] = [];
   const visited = new Set<string>();
   let expansions = 0;
-  for (;;) {
-    let cursor = current;
-    const suffix: string[] = [];
-    while (!links.has(cursor)) {
-      const parent = dirname(cursor);
-      if (parent === cursor) return { path: current, chain, cycle: false };
-      suffix.unshift(basename(cursor));
-      cursor = parent;
-    }
-    const state = JSON.stringify([cursor, suffix]);
-    if (visited.has(state) || ++expansions > 40) return { path: current, chain, cycle: true };
+  while (pending.length) {
+    const component = pending.shift()!;
+    if (!component || component === '.') continue;
+    if (component === '..') { if (components.length) components.pop(); continue; }
+    const candidate = resolve(root, ...components, component);
+    const linkTarget = links.get(candidate);
+    if (linkTarget === undefined) { components.push(component); continue; }
+    const state = JSON.stringify([candidate, pending]);
+    if (visited.has(state) || ++expansions > 40) return { path: resolve(root, ...components, component), chain, cycle: true };
     visited.add(state);
-    chain.push(cursor);
-    current = resolve(dirname(cursor), links.get(cursor)!, ...suffix);
+    chain.push(candidate);
+    if (isAbsolute(linkTarget)) components.length = 0;
+    pending.unshift(...linkTarget.split(/[\\/]/));
   }
+  return { path: resolve(root, ...components), chain, cycle: false };
 }
 
 function orderSymlinkChanges(operations: readonly Operation[], preconditions: readonly PathSnapshot[], findings: Finding[]): Operation[] {
@@ -260,8 +263,7 @@ function orderSymlinkChanges(operations: readonly Operation[], preconditions: re
   for (const operation of links) {
     const path = resolve(operation.path);
     if (operation.kind === 'symlink') {
-      const target = resolve(dirname(path), operation.target);
-      const resolution = resolveSymlinkPath(target, finalLinks);
+      const resolution = resolveSymlinkPath(dirname(path), operation.target, finalLinks);
       if (resolution.cycle) findings.push(issue('SYMLINK_DEPENDENCY_CYCLE', 'A planned link target contains a dependency cycle.', path));
       for (const [candidate, dependency] of byPath) {
         if (dependency.kind === 'remove' && isWithin(candidate, resolution.path)) {
@@ -271,9 +273,8 @@ function orderSymlinkChanges(operations: readonly Operation[], preconditions: re
       for (const candidate of resolution.chain) if (byPath.get(candidate)?.kind === 'symlink') addEdge(candidate, path);
     }
     if (operation.expected.kind === 'symlink') {
-      const oldTarget = resolve(dirname(path), operation.expected.linkTarget ?? '');
-      const before = resolveSymlinkPath(oldTarget, currentLinks);
-      const after = resolveSymlinkPath(oldTarget, finalLinks);
+      const before = resolveSymlinkPath(dirname(path), operation.expected.linkTarget ?? '', currentLinks);
+      const after = resolveSymlinkPath(dirname(path), operation.expected.linkTarget ?? '', finalLinks);
       const expectedReferent = resolve(operation.expected.resolvedPath);
       if (before.cycle || after.cycle || before.path !== expectedReferent) {
         findings.push(issue('SYMLINK_DEPENDENCY_UNRESOLVED', 'A planned link no longer resolves through its reviewed native chain.', path));

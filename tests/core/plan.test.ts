@@ -111,6 +111,34 @@ it('plans complete copy trees with binary assets, empty directories, executable 
   expect(await readlink(join(target, 'inspect-link'))).toBe('scripts/inspect-link');
 });
 
+it('resolves dot-dot after expanding a symlink component during apply', async () => {
+  sandbox = await createSandbox();
+  const source = await putSkill(join(sandbox.context.projectRoot, '.claude', 'skills'), 'component-links', 'Component path guidance');
+  await mkdir(join(source, 'sub', 'deep'), { recursive: true });
+  await putFile(join(source, 'sub', 'b'), 'resolved beneath sub');
+  await symlink('sub/deep', join(source, 'dir'));
+  await symlink('dir/../b', join(source, 'a'));
+  await symlink('a', join(source, 'b-link'));
+  const inventory = await inventoryFor();
+  const selected = skill(inventory, 'component-links', source);
+  const plan = await planSync(sandbox.context, inventory,
+    request([selected.id], [{ agentId: 'codex', placement: 'user' }]), await loadState());
+  expect(plan.findings.some(finding => finding.severity === 'error'), JSON.stringify(plan.findings)).toBe(false);
+  const operations = resources(plan.operations);
+  const dirLink = operations.findIndex(operation => operation.kind === 'symlink' && operation.path.endsWith('/dir'));
+  const pathLink = operations.findIndex(operation => operation.kind === 'symlink' && operation.path.endsWith('/a'));
+  const dependentLink = operations.findIndex(operation => operation.kind === 'symlink' && operation.path.endsWith('/b-link'));
+  const pathOperation = operations.find(operation => operation.kind === 'symlink' && operation.path.endsWith('/a'));
+  expect(pathOperation?.kind === 'symlink' && pathOperation.target === 'dir/../b').toBe(true);
+  expect(pathLink).toBeGreaterThan(dirLink);
+  expect(dependentLink).toBeGreaterThan(pathLink);
+  const applied = await applyPlan(plan, { confirmed: true });
+  expect(applied.status, JSON.stringify(applied.findings)).toBe('applied');
+  const target = join(sandbox.context.homeDir, '.agents', 'skills', 'component-links');
+  expect(await readFile(join(target, 'a'), 'utf8')).toBe('resolved beneath sub');
+  expect(await readFile(join(target, 'b-link'), 'utf8')).toBe('resolved beneath sub');
+});
+
 it('applies a finite repeated directory-symlink path without mistaking it for a cycle', async () => {
   sandbox = await createSandbox();
   const sourceRoot = join(sandbox.context.projectRoot, 'provided-skills');
