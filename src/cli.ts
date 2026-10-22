@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { readFile } from 'node:fs/promises';
+import { readFile, realpath } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -83,6 +83,15 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
   }
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
-  await main();
+async function isCliEntry(): Promise<boolean> {
+  if (!process.argv[1]) return false;
+  let entryPath = resolve(process.argv[1]);
+  try {
+    entryPath = await realpath(entryPath);
+  } catch {
+    // Keep the absolute invocation path as a safe fallback.
+  }
+  return import.meta.url === pathToFileURL(entryPath).href;
 }
+
+if (await isCliEntry()) await main();
