@@ -299,7 +299,7 @@ export const piAdapter: NativeAdapter = {
         const nativePath = ['mcpServers', name];
         const before = Object.hasOwn(entries, name) ? fingerprintValue(entries[name]) : undefined;
         const after = fingerprintValue(native);
-        targets.push({ resourceId: resource.id, key: name, path: document.snapshot.resolvedPath, slotId: fingerprintValue([document.snapshot.resolvedPath, 'mcp', JSON.stringify(nativePath)]), ...(before === undefined ? {} : { beforeFingerprint: before }), afterFingerprint: after });
+        targets.push({ resourceId: resource.id, key: name, path, slotId: fingerprintValue([document.snapshot.resolvedPath, 'mcp', JSON.stringify(nativePath)]), ...(before === undefined ? {} : { beforeFingerprint: before }), afterFingerprint: after });
         if (before !== after) changes.push({ path: nativePath, value: native });
       }
       if (findings.some(finding => finding.severity === 'error')) return { files: [], targets: [], findings };

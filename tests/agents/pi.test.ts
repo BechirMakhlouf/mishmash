@@ -277,8 +277,16 @@ describe('Pi native adapter', () => {
     await symlink(physical, join(sandbox.context.projectRoot, '.pi'));
     const sources = await openCodeSources({ selected: { type: 'local', command: ['never'] } });
     const result = await piAdapter.prepareMcpEdit(sandbox.context, 'project', sources);
-    expect(result.targets[0]?.path).toBe(join(physical, 'mcp.json'));
+    expect(result.targets[0]?.path).toBe(projectConfig());
     expect(result.targets[0]?.slotId).toBe(fingerprintValue([join(physical, 'mcp.json'), 'mcp', JSON.stringify(['mcpServers', 'selected'])]));
+    await putFile(projectConfig(), result.files[0]!.bytes);
+    const before = await snapshotPath(sandbox.root);
+    const unchanged = await piAdapter.prepareMcpEdit(sandbox.context, 'project', sources);
+    expect(unchanged.files).toHaveLength(0);
+    expect(unchanged.targets[0]?.path).toBe(projectConfig());
+    expect(unchanged.targets[0]?.slotId).toBe(fingerprintValue([join(physical, 'mcp.json'), 'mcp', JSON.stringify(['mcpServers', 'selected'])]));
+    expect(unchanged.targets[0]?.beforeFingerprint).toBe(unchanged.targets[0]?.afterFingerprint);
+    expect(await snapshotMatches(before)).toBe(true);
   });
 
   it('reports unsafe asset links and malformed metadata without leaking their bodies', async () => {
