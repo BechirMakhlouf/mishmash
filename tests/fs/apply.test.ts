@@ -357,4 +357,44 @@ describe('applyPlan', () => {
     expect((await snapshotPath(join(output, 'a'))).resolvedPath).toBe(join(output, 'sub', 'b'));
     expect(snapshotsEqual(before, await snapshotPath(source))).toBe(true);
   });
+
+  it('accepts a physically contained source link whose parent traversal lexically escapes', async () => {
+    const { context } = await sandbox();
+    const source = join(context.projectRoot, 'source');
+    const output = join(context.projectRoot, 'output');
+    const binary = Uint8Array.from([0, 255, 128, 42]);
+    await putFile(join(source, 'b'), binary, 0o640);
+    await mkdir(join(source, 'sub', 'deep'), { recursive: true });
+    await symlink('sub/deep', join(source, 'dir'));
+    await symlink('dir/../../b', join(source, 'a'));
+    const before = await snapshotPath(source);
+    const operations: Operation[] = [
+      await directory(output),
+      await directory(join(output, 'sub')),
+      await directory(join(output, 'sub', 'deep')),
+      await copy(join(source, 'b'), join(output, 'b'), 0o640),
+      await link(join(output, 'dir'), 'sub/deep'),
+      await link(join(output, 'a'), 'dir/../../b'),
+    ];
+    const result = await applyPlan(plan(context, operations, [before]), { confirmed: true });
+    expect(result.status).toBe('applied');
+    expect(await readlink(join(output, 'a'))).toBe('dir/../../b');
+    expect(await bytesEqual(join(output, 'a'), binary)).toBe(true);
+    expect((await snapshotPath(join(output, 'a'))).resolvedPath).toBe(join(output, 'b'));
+    expect(snapshotsEqual(before, await snapshotPath(source))).toBe(true);
+  });
+
+  it('blocks a physically escaping source link even when lexical normalization looks contained', async () => {
+    const { root, context } = await sandbox();
+    const source = join(context.projectRoot, 'source');
+    await putFile(join(source, 'b'), 'reviewed file');
+    await putFile(join(context.projectRoot, 'b'), 'unapproved external file');
+    await symlink('.', join(source, 'dir'));
+    await symlink('dir/../b', join(source, 'a'));
+    const reviewed = plan(context, [await copy(join(source, 'b'), join(context.projectRoot, 'output'))], [await snapshotPath(source)]);
+    const before = await snapshotPath(root);
+    expect((await applyPlan(reviewed, { confirmed: true })).status).toBe('blocked');
+    expect(snapshotsEqual(before, await snapshotPath(root))).toBe(true);
+    expect((await readdir(context.stateHome)).length).toBe(0);
+  });
 });
