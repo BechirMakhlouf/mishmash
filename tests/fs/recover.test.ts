@@ -1,11 +1,12 @@
 import { writeFileSync } from 'node:fs';
-import { chmod, mkdir, readFile, readdir, readlink, rename, stat, symlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, readFile, readdir, readlink, rename, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { Context, Plan, TransactionJournal } from '../../src/model.js';
 import { applyPlan } from '../../src/fs/apply.js';
 import { inspectRecovery, recoverTransaction } from '../../src/fs/recover.js';
 import { hashBytes, snapshotPath, snapshotsEqual } from '../../src/fs/snapshot.js';
+import { acquireLock } from '../../src/fs/transaction.js';
 import { encodeJournal, getStatePaths } from '../../src/state.js';
 import { createSandbox, putFile, type Sandbox } from '../helpers/sandbox.js';
 
@@ -207,5 +208,130 @@ describe('explicit transaction recovery', () => {
     const bad = { ...transaction.journal, entries: transaction.journal.entries.map(entry => ({ ...entry, backupPath: context.homeDir })) };
     expect((await recoverTransaction({ path: transaction.path, journal: bad }, { confirmed: true })).status).toBe('recovery-required');
     expect((await readdir(context.homeDir)).length).toBe(0);
+  });
+
+  it('serializes concurrent dead-owner claims and excludes concurrent recovery and apply writers', async () => {
+    const { context } = await sandbox();
+    const transaction = await interruptedWrite(context);
+    const paths = await getStatePaths(context);
+    const intent: TransactionJournal = { version: 1, id: transaction.journal.id, context, status: 'prepared', entries: [] };
+    await putFile(paths.lockPath, JSON.stringify({ pid: 2147483647, token: 'dead-owner', journal: intent }), 0o600);
+    const claims = await Promise.allSettled(Array.from({ length: 12 }, () => acquireLock(paths.lockPath, true, intent)));
+    const winners = claims.filter((claim): claim is PromiseFulfilledResult<() => Promise<void>> => claim.status === 'fulfilled');
+    expect(winners.length).toBe(1);
+    const winningLock = await snapshotPath(paths.lockPath);
+    const output = join(context.projectRoot, 'new-output');
+    const reviewed = plan(context);
+    reviewed.operations = [{ kind: 'write', path: output, expected: await snapshotPath(output), mode: 0o644, content: { kind: 'bytes', bytes: Buffer.from('must not write') }, resourceIds: [], purpose: 'resource', description: 'Concurrent apply' }];
+    const attempts = await Promise.all([recoverTransaction(transaction, { confirmed: true }), recoverTransaction(transaction, { confirmed: true }), applyPlan(reviewed, { confirmed: true })]);
+    expect(attempts.every(result => result.status !== 'recovered' && result.status !== 'applied')).toBe(true);
+    expect(await bytesEqual(transaction.target, 'approved new data')).toBe(true);
+    expect((await snapshotPath(output)).kind).toBe('missing');
+    expect(snapshotsEqual(winningLock, await snapshotPath(paths.lockPath))).toBe(true);
+    await winners[0]!.value();
+    const recoveries = await Promise.all([recoverTransaction(transaction, { confirmed: true }), recoverTransaction(transaction, { confirmed: true }), applyPlan(reviewed, { confirmed: true })]);
+    expect(recoveries.filter(result => result.status === 'recovered').length).toBe(1);
+    expect(recoveries.filter(result => result.status === 'applied').length).toBe(0);
+    expect(await bytesEqual(transaction.target, 'original private data')).toBe(true);
+  });
+
+  it.each(['intent', 'restored'] as const)('cleans stages before retrying parent rollback after a crash with a child marked %s', async childState => {
+    const { context } = await sandbox();
+    const paths = await getStatePaths(context);
+    await privateDirectory(join(context.stateHome, 'mishmash'));
+    await privateDirectory(paths.transactionRoot);
+    const path = join(paths.transactionRoot, 'crash-stages');
+    await privateDirectory(path);
+    const parent = join(context.projectRoot, 'created');
+    const parentBefore = await snapshotPath(parent);
+    await mkdir(parent);
+    const parentAfter = await snapshotPath(parent);
+    const child = join(parent, 'child');
+    const childBefore = await snapshotPath(child);
+    await putFile(child, 'approved child');
+    const childAfter = await snapshotPath(child);
+    await rm(child);
+    await privateDirectory(join(parent, '.mishmash-crash-stages-1'));
+    await putFile(join(parent, '.mishmash-crash-stages-1', 'payload'), 'staged child', 0o600);
+    await privateDirectory(join(parent, '.mishmash-crash-stages-1-recovery'));
+    const journal: TransactionJournal = { version: 1, id: 'crash-stages', context, status: 'recovering', entries: [
+      { path: parent, before: parentBefore, after: parentAfter, operation: 'mkdir', state: 'replaced' },
+      { path: child, before: childBefore, after: childAfter, operation: 'write', state: childState },
+    ] };
+    await persist(path, journal);
+    expect((await recoverTransaction({ path, journal }, { confirmed: true })).status).toBe('recovered');
+    expect((await snapshotPath(parent)).kind).toBe('missing');
+    expect((await readdir(context.projectRoot)).length).toBe(0);
+    expect((await inspectRecovery(context)).transactions.length).toBe(0);
+  });
+
+  it.each(['committed', 'recovered'] as const)('ignores %s history from a deleted project while retaining its backups', async status => {
+    const { root, context } = await sandbox();
+    const transaction = await interruptedWrite(context);
+    await persist(transaction.path, { ...transaction.journal, status });
+    await rm(context.projectRoot, { recursive: true });
+    const nextContext = { ...context, projectRoot: join(root, 'next-project') };
+    await mkdir(nextContext.projectRoot);
+    const inspection = await inspectRecovery(nextContext);
+    expect(inspection.transactions.length).toBe(0);
+    expect(inspection.findings.length).toBe(0);
+    const target = join(nextContext.projectRoot, 'output');
+    const reviewed = plan(nextContext);
+    reviewed.operations = [{ kind: 'write', path: target, expected: await snapshotPath(target), mode: 0o644, content: { kind: 'bytes', bytes: Buffer.from('next project') }, resourceIds: [], purpose: 'resource', description: 'New project output' }];
+    expect((await applyPlan(reviewed, { confirmed: true })).status).toBe('applied');
+    expect(await bytesEqual(target, 'next project')).toBe(true);
+    expect(await bytesEqual(join(transaction.backup, hashBytes('')), 'original private data')).toBe(true);
+  });
+
+  it.each(['file', 'directory'] as const)('settles a real %s chmod rollback before marking recovery complete', async kind => {
+    const { context } = await sandbox();
+    const target = join(context.projectRoot, 'mode-target');
+    if (kind === 'file') await putFile(target, 'unchanged data', 0o640);
+    else { await mkdir(target, { mode: 0o750 }); await putFile(join(target, 'asset'), 'unchanged asset'); }
+    const before = await snapshotPath(target);
+    const reviewed = plan(context);
+    reviewed.operations = [{ kind: 'chmod', path: target, expected: before, mode: 0o700, resourceIds: [], purpose: 'resource', description: 'Change approved mode' }];
+    let observed = false;
+    const result = await applyPlan(reviewed, { confirmed: true, onCheckpoint: (phase, path) => { if (phase === 'replaced' && path === target) { observed = true; throw new Error('rollback real chmod'); } } });
+    expect(observed).toBe(true);
+    expect(result.status).toBe('recovered');
+    expect(snapshotsEqual(before, await snapshotPath(target))).toBe(true);
+    expect((await inspectRecovery(context)).transactions.length).toBe(0);
+    const settled = JSON.parse(await readFile(join(result.transactionPath!, 'journal.json'), 'utf8')) as TransactionJournal;
+    expect(settled.status).toBe('recovered');
+    expect(settled.entries[0]!.state).toBe('restored');
+  });
+
+  it('surfaces a stranded exclusive guard with actionable manual recovery guidance without deleting it', async () => {
+    const { root, context } = await sandbox();
+    const transaction = await interruptedWrite(context);
+    const paths = await getStatePaths(context);
+    const guard = `${paths.lockPath}.guard`;
+    await putFile(guard, 'corrupt-owner-data', 0o600);
+    const before = await snapshotPath(root);
+    const inspection = await inspectRecovery(context);
+    const issue = inspection.findings.find(item => item.code === 'LOCK_GUARD_PENDING');
+    expect(issue?.path).toBe(guard);
+    expect(issue?.remediation?.includes('manually')).toBe(true);
+    expect((await recoverTransaction(transaction, { confirmed: true })).status).toBe('blocked');
+    expect((await applyPlan(plan(context), { confirmed: true })).status).toBe('blocked');
+    expect(snapshotsEqual(before, await snapshotPath(root))).toBe(true);
+  });
+
+  it('refuses to unlink a replacement lock even when its bytes duplicate the original owner record', async () => {
+    const { context } = await sandbox();
+    const transaction = await interruptedWrite(context);
+    const paths = await getStatePaths(context);
+    const intent: TransactionJournal = { version: 1, id: transaction.journal.id, context, status: 'prepared', entries: [] };
+    const release = await acquireLock(paths.lockPath, false, intent);
+    const bytes = await readFile(paths.lockPath);
+    const replacement = join(context.stateHome, 'mishmash', 'replacement-lock');
+    await putFile(replacement, bytes, 0o600);
+    await rename(replacement, paths.lockPath);
+    const external = await stat(paths.lockPath, { bigint: true });
+    await expect(release()).rejects.toThrow('LOCK_CHANGED');
+    expect((await stat(paths.lockPath, { bigint: true })).ino).toBe(external.ino);
+    expect((await readFile(paths.lockPath)).equals(bytes)).toBe(true);
+    expect((await snapshotPath(`${paths.lockPath}.guard`)).kind).toBe('missing');
   });
 });

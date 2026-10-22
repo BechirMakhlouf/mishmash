@@ -7,7 +7,7 @@ import { decodeJournal, encodeJournal, getStatePaths } from '../state.js';
 import { errorCode, fingerprintValue, hashBytes, isWithin, snapshotMatches, snapshotPath, snapshotsEqual } from './snapshot.js';
 
 export const journalName = 'journal.json';
-export const finding = (code: string, path?: string): Finding => ({ severity: 'error', code, path, message: 'The reviewed filesystem change could not be completed safely.', remediation: 'Review the affected location and any pending recovery before trying again.' });
+export const finding = (code: string, path?: string): Finding => ({ severity: 'error', code, path, message: 'The reviewed filesystem change could not be completed safely.', remediation: code === 'LOCK_GUARD_PENDING' ? 'Check the guard owner PID and verify all mishmash writers have stopped. Preserve lock and transaction data; remove only this guard manually once no writer can still own it, then inspect recovery again. If ownership cannot be established, leave it in place.' : 'Review the affected location and any pending recovery before trying again.' });
 export class TransactionError extends Error {
   constructor(readonly code: string, readonly path?: string) { super(code); }
 }
@@ -36,42 +36,78 @@ export async function privateDirectory(path: string, effects?: Effects): Promise
     if (effects) await recordEffect(effects, await snapshotPath(path));
   }
 }
+async function ensureStateAncestors(path: string, effects: Effects): Promise<void> {
+  const absolute = resolve(path);
+  const parent = dirname(absolute);
+  if (parent !== absolute) await ensureStateAncestors(parent, effects);
+  try {
+    if (!(await lstat(absolute)).isDirectory()) throw new TransactionError('UNSAFE_STATE_PATH', absolute);
+  } catch (error) {
+    if (errorCode(error) !== 'ENOENT') throw error;
+    try { await mkdir(absolute, { mode: 0o700 }); }
+    catch (creationError) { if (errorCode(creationError) !== 'EEXIST') throw creationError; }
+    const stat = await lstat(absolute);
+    if (!stat.isDirectory() || (stat.mode & 0o777) !== 0o700) throw new TransactionError('UNSAFE_STATE_PATH', absolute);
+    await syncDirectory(absolute);
+    await syncDirectory(parent);
+    await recordEffect(effects, await snapshotPath(absolute));
+  }
+}
 export async function initializeStorage(context: Context, effects: Effects): Promise<{ transactionRoot: string; lockPath: string }> {
   const paths = await getStatePaths(context);
-  const state = await lstat(context.stateHome);
-  if (!state.isDirectory()) throw new TransactionError('UNSAFE_STATE_PATH', context.stateHome);
+  await ensureStateAncestors(context.stateHome, effects);
   await privateDirectory(dirname(paths.lockPath), effects);
   return paths;
 }
-export async function acquireLock(lockPath: string, reclaim = false, journal?: TransactionJournal): Promise<() => Promise<void>> {
-  const token = randomUUID();
+async function guardLock<T>(lockPath: string, action: () => Promise<T>): Promise<T> {
+  const guard = `${lockPath}.guard`;
   let handle;
-  try { handle = await open(lockPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600); }
-  catch (error) {
-    if (errorCode(error) !== 'EEXIST' || !reclaim) throw new TransactionError('APPLY_LOCKED', lockPath);
-    const reviewed = await snapshotPath(lockPath);
-    if (reviewed.kind !== 'file') throw new TransactionError('UNSAFE_LOCK', lockPath);
-    let owner: unknown;
-    try { owner = JSON.parse(await readFile(lockPath, 'utf8')) as unknown; } catch { throw new TransactionError('UNSAFE_LOCK', lockPath); }
-    if (typeof owner !== 'object' || owner === null || !('pid' in owner) || !Number.isSafeInteger(owner.pid) || Number(owner.pid) <= 0 || !('token' in owner) || typeof owner.token !== 'string' || owner.token.length === 0) throw new TransactionError('UNSAFE_LOCK', lockPath);
-    try { process.kill(Number(owner.pid), 0); throw new TransactionError('APPLY_LOCKED', lockPath); }
-    catch (ownerError) { if (errorCode(ownerError) !== 'ESRCH') throw ownerError; }
-    if (!await snapshotMatches(reviewed)) throw new TransactionError('APPLY_LOCKED', lockPath);
-    await unlink(lockPath);
-    return acquireLock(lockPath, false, journal);
-  }
+  try { handle = await open(guard, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600); }
+  catch { throw new TransactionError('LOCK_GUARD_PENDING', guard); }
   try {
     await handle.chmod(0o600);
-    await handle.writeFile(JSON.stringify({ pid: process.pid, token, journal }));
+    await handle.writeFile(JSON.stringify({ pid: process.pid, token: randomUUID() }));
     await handle.sync();
-    await syncDirectory(dirname(lockPath));
+    await syncDirectory(dirname(guard));
+    const owned = await identity(guard);
+    try { return await action(); }
+    finally {
+      if (fingerprintValue(owned) !== fingerprintValue(await identity(guard))) throw new TransactionError('LOCK_GUARD_CHANGED', guard);
+      await unlink(guard);
+      await syncDirectory(dirname(guard));
+    }
   } finally { await handle.close(); }
-  const owned = await snapshotPath(lockPath);
-  return async () => {
-    if (!await snapshotMatches(owned)) throw new TransactionError('LOCK_CHANGED', lockPath);
+}
+export async function acquireLock(lockPath: string, reclaim = false, journal?: TransactionJournal): Promise<() => Promise<void>> {
+  const owned = await guardLock(lockPath, async () => {
+    try {
+      const existing = await snapshotPath(lockPath);
+      if (existing.kind !== 'missing') {
+        if (!reclaim) throw new TransactionError('APPLY_LOCKED', lockPath);
+        if (existing.kind !== 'file' || existing.mode !== 0o600) throw new TransactionError('UNSAFE_LOCK', lockPath);
+        const owner: unknown = JSON.parse(await readFile(lockPath, 'utf8'));
+        if (typeof owner !== 'object' || owner === null || !('pid' in owner) || !Number.isSafeInteger(owner.pid) || Number(owner.pid) <= 0 || !('token' in owner) || typeof owner.token !== 'string' || owner.token.length === 0) throw new TransactionError('UNSAFE_LOCK', lockPath);
+        try { process.kill(Number(owner.pid), 0); throw new TransactionError('APPLY_LOCKED', lockPath); }
+        catch (error) { if (errorCode(error) !== 'ESRCH') throw error; }
+        if (!await snapshotMatches(existing)) throw new TransactionError('APPLY_LOCKED', lockPath);
+        await unlink(lockPath);
+        await syncDirectory(dirname(lockPath));
+      }
+      const handle = await open(lockPath, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600);
+      try {
+        await handle.chmod(0o600);
+        await handle.writeFile(JSON.stringify({ pid: process.pid, token: randomUUID(), journal }));
+        await handle.sync();
+        await syncDirectory(dirname(lockPath));
+      } finally { await handle.close(); }
+      return { snapshot: await snapshotPath(lockPath), identity: await identity(lockPath) };
+    } catch (error) { if (error instanceof TransactionError) throw error; throw new TransactionError('UNSAFE_LOCK', lockPath); }
+  });
+  return () => guardLock(lockPath, async () => {
+    if (!await snapshotMatches(owned.snapshot) || fingerprintValue(owned.identity) !== fingerprintValue(await identity(lockPath))) throw new TransactionError('LOCK_CHANGED', lockPath);
     await unlink(lockPath);
     await syncDirectory(dirname(lockPath));
-  };
+  });
 }
 export async function persistJournal(path: string, journal: TransactionJournal, effects?: Effects): Promise<void> {
   const next = join(path, '.journal-next');
@@ -121,8 +157,7 @@ export async function scanRecovery(context: Context): Promise<{ transactions: { 
       const path = join(transactionRoot, name);
       try {
         const journal = await readJournal(path, transactionRoot);
-        const actual = await getStatePaths(journal.context);
-        if (resolve(actual.transactionRoot) !== resolve(transactionRoot)) throw new TransactionError('INVALID_RECOVERY_CONTEXT', path);
+        if (resolve(journal.context.stateHome, 'mishmash', 'transactions') !== resolve(transactionRoot)) throw new TransactionError('INVALID_RECOVERY_CONTEXT', path);
         if (journal.status !== 'committed' && journal.status !== 'recovered') transactions.push({ path, journal });
       } catch (error) {
         if (error instanceof TransactionError && error.code === 'MISSING_RECOVERY_JOURNAL') incomplete.add(path);
@@ -154,6 +189,9 @@ export async function scanRecovery(context: Context): Promise<{ transactions: { 
       if (!await snapshotMatches(lock)) throw new TransactionError('LOCK_CHANGED', lockPath);
     }
   } catch { findings.push(finding('UNSAFE_LOCK', lockPath)); }
+  const guard = `${lockPath}.guard`;
+  try { await lstat(guard); findings.push(finding('LOCK_GUARD_PENDING', guard)); }
+  catch (error) { if (errorCode(error) !== 'ENOENT') findings.push(finding('LOCK_GUARD_PENDING', guard)); }
   for (const path of incomplete) findings.push(finding('INVALID_RECOVERY_JOURNAL', path));
   return { transactions, findings };
 }
@@ -311,8 +349,11 @@ export async function rollback(path: string, journal: TransactionJournal): Promi
   // Reverse order restores children before their containing directory and state before resources.
   for (let index = current.entries.length - 1; index >= 0; index--) {
     const entry = current.entries[index]!;
-    if (entry.state === 'restored') continue;
-    if (entry.state === 'prepared') { await removeStage(path, index, entry); continue; }
+    if (entry.state === 'restored' || entry.state === 'prepared') {
+      await removeStage(path, index, entry);
+      await removeStage(path, index, entry, true);
+      continue;
+    }
     try {
       const actual = await snapshotPath(entry.path);
       const unchanged = snapshotsEqual(entry.before, actual);
@@ -337,6 +378,10 @@ export async function rollback(path: string, journal: TransactionJournal): Promi
         }
         await syncDirectory(dirname(entry.path));
       }
+      if (entry.operation === 'chmod') {
+        const handle = await open(entry.path, constants.O_RDONLY | constants.O_NOFOLLOW);
+        try { await handle.sync(); } finally { await handle.close(); }
+      }
       const entries = [...current.entries];
       if (entry.before.kind === 'directory') {
         const restoredParents = newEffects();
@@ -351,11 +396,11 @@ export async function rollback(path: string, journal: TransactionJournal): Promi
           entries[earlier] = { ...prior, before: adjustedSnapshot(prior.before, restoredParents), ...(prior.after ? { after: adjustedSnapshot(prior.after, restoredParents) } : {}) };
         }
       }
+      await removeStage(path, index, entry);
+      await removeStage(path, index, entry, true);
       entries[index] = { ...entry, state: 'restored' };
       current = { ...current, entries };
       await persistJournal(path, current);
-      await removeStage(path, index, entry);
-      await removeStage(path, index, entry, true);
     } catch { findings.push(finding('RECOVERY_CONFLICT', entry.path)); break; }
   }
   current = { ...current, status: findings.length ? 'recovery-required' : 'recovered' };

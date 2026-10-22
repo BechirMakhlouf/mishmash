@@ -298,4 +298,32 @@ describe('applyPlan', () => {
     expect((await snapshotPath(paths.ownershipPath)).kind).toBe('missing');
     expect((await inspectRecovery(context)).transactions.length).toBe(0);
   });
+
+  it('creates an approved absent XDG state root and missing ancestors privately only after confirmation', async () => {
+    const { root, context: existingContext } = await sandbox();
+    const context = { ...existingContext, stateHome: join(root, 'absent', 'nested', 'state') };
+    const target = join(context.projectRoot, 'output');
+    const paths = await getStatePaths(context);
+    const reviewed = plan(context, [await write(target, 'approved'), await write(paths.ownershipPath, encodeOwnershipState({ version: 1, receipts: [] }), 'state', 0o600)]);
+    const before = await snapshotPath(root);
+    expect((await applyPlan(reviewed, { confirmed: false })).status).toBe('declined');
+    expect(snapshotsEqual(before, await snapshotPath(root))).toBe(true);
+    expect((await applyPlan(reviewed, { confirmed: true })).status).toBe('applied');
+    expect(await bytesEqual(target, 'approved')).toBe(true);
+    for (const directory of [join(root, 'absent'), join(root, 'absent', 'nested'), context.stateHome, dirname(paths.lockPath)]) expect((await stat(directory)).mode & 0o777).toBe(0o700);
+    expect((await stat(paths.ownershipPath)).mode & 0o777).toBe(0o600);
+  });
+
+  it.each(['symlink', 'file'] as const)('rejects an unsafe %s ancestor of an absent XDG state root without writes', async kind => {
+    const { root, context: existingContext } = await sandbox();
+    const ancestor = join(root, 'unsafe-state');
+    if (kind === 'symlink') await symlink(existingContext.homeDir, ancestor);
+    else await putFile(ancestor, 'not a directory');
+    const context = { ...existingContext, stateHome: join(ancestor, 'state') };
+    const target = join(context.projectRoot, 'output');
+    const reviewed = plan(context, [await write(target, 'must not write')]);
+    const before = await snapshotPath(root);
+    expect((await applyPlan(reviewed, { confirmed: true })).status).toBe('blocked');
+    expect(snapshotsEqual(before, await snapshotPath(root))).toBe(true);
+  });
 });
