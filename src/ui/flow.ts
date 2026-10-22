@@ -38,8 +38,8 @@ function operationSummary(plan: Plan): string {
   return errors ? `Plan ready with ${errors} blocking issue${errors === 1 ? '' : 's'}` : 'Plan ready for review';
 }
 
-async function withSpinner<T>(message: string, task: () => Promise<T>, completed: (value: T) => string, failed: string): Promise<T> {
-  const indicator = spinner();
+async function withSpinner<T>(message: string, task: () => Promise<T>, completed: (value: T) => string, failed: string, signal: AbortSignal): Promise<T> {
+  const indicator = spinner({ signal });
   let stopped = false;
   indicator.start(message);
   try {
@@ -56,12 +56,45 @@ async function withSpinner<T>(message: string, task: () => Promise<T>, completed
   }
 }
 
-async function discoverInventory(context: Context): Promise<Inventory> {
-  const inventory = await withSpinner(
+/** Clack 1.8.1's spinner uses block(), whose Escape handler calls process.exit(0). */
+export async function withClackSpinnerExitAbort<T>(task: () => Promise<T>, requestAbort: (reason: Error) => void): Promise<T> {
+  const originalExit = process.exit;
+  process.exit = function (code?: number): never {
+    if (code === 0) {
+      requestAbort(new Error('Clack spinner cancelled.'));
+      return undefined as never;
+    }
+    return originalExit.call(process, code);
+  };
+  try {
+    return await task();
+  } finally {
+    process.exit = originalExit;
+  }
+}
+
+async function withSafeSpinner<T>(
+  message: string,
+  task: () => Promise<T>,
+  completed: (value: T) => string,
+  failed: string,
+  signal: AbortSignal,
+  requestAbort: (reason: Error) => void,
+): Promise<T> {
+  return withClackSpinnerExitAbort(
+    () => withSpinner(message, task, completed, failed, signal),
+    requestAbort,
+  );
+}
+
+async function discoverInventory(context: Context, signal: AbortSignal, requestAbort: (reason: Error) => void): Promise<Inventory> {
+  const inventory = await withSafeSpinner(
     'Discovering skills and MCP registrations…',
     () => discover(context),
     result => `${result.resources.filter(resource => resource.kind === 'skill').length} skills · ${result.resources.filter(resource => resource.kind === 'mcp').length} MCP registrations found`,
     'Discovery could not be completed safely.',
+    signal,
+    requestAbort,
   );
   log.message(renderDiscoverySummary(inventory));
   for (const finding of inventory.findings) log.message(renderFinding(finding));
@@ -72,6 +105,38 @@ async function loadState(context: Context, configuration: ConfigurationScope): P
   const state = await readState(context, configuration);
   for (const finding of state.findings) log.message(renderFinding(finding));
   return state;
+}
+
+async function includeRememberedSharedSources(context: Context, scopes: readonly ConfigurationScope[]): Promise<Context> {
+  const states = await Promise.all(scopes.map(scope => readState(context, scope).catch(() => undefined)));
+  const existingIds = new Set((context.extraSources ?? []).map(source => source.id));
+  const candidates = new Map<string, SourceRef>();
+  for (const state of states) {
+    for (const source of state?.choices?.sources ?? []) {
+      if (source.agentId !== 'shared' || existingIds.has(source.id)) continue;
+      const existing = candidates.get(source.id);
+      const agents = [...new Set([...(existing?.agents ?? []), ...(source.agents ?? [])])].sort();
+      candidates.set(source.id, existing ? { ...existing, agents } : source);
+    }
+  }
+  const remembered: SourceRef[] = [];
+  for (const source of candidates.values()) {
+    try {
+      if ((await stat(source.path)).isDirectory()) remembered.push(source);
+    } catch {
+      // Missing or unreadable roots remain visible through the selected state's authority findings.
+    }
+  }
+  return remembered.length ? { ...context, extraSources: [...(context.extraSources ?? []), ...remembered] } : context;
+}
+
+async function discoverRememberedInventory(
+  context: Context,
+  signal: AbortSignal,
+  requestAbort: (reason: Error) => void,
+  scopes: readonly ConfigurationScope[] = ['private-project', 'project', 'user'],
+): Promise<Inventory> {
+  return discoverInventory(await includeRememberedSharedSources(context, scopes), signal, requestAbort);
 }
 
 async function chooseConfiguration(
@@ -157,6 +222,8 @@ async function emptyDiscoveryLoop(
   initialContext: Context,
   initialInventory: Inventory,
   signal: AbortSignal,
+  requestAbort: (reason: Error) => void,
+  rememberedScopes: readonly ConfigurationScope[] = ['private-project', 'project', 'user'],
 ): Promise<{ context: Context; inventory: Inventory } | undefined> {
   let context = initialContext;
   let inventory = initialInventory;
@@ -175,21 +242,23 @@ async function emptyDiscoveryLoop(
     const nextContext = action === 'context' ? await changeContext(context, signal) : await addExistingSource(context, signal);
     if (!nextContext) return undefined;
     if (action === 'context') {
-      const recovery = await recoverPending(nextContext, signal);
+      const recovery = await recoverPending(nextContext, signal, requestAbort);
       if (recovery !== 'ready') return undefined;
     }
     context = nextContext;
-    inventory = await discoverInventory(context);
+    inventory = await discoverRememberedInventory(context, signal, requestAbort, rememberedScopes);
   }
   return signal.aborted ? undefined : { context, inventory };
 }
 
-async function recoverPending(context: Context, signal: AbortSignal): Promise<'ready' | 'cancelled' | 'blocked'> {
-  const status = await withSpinner(
+async function recoverPending(context: Context, signal: AbortSignal, requestAbort: (reason: Error) => void): Promise<'ready' | 'cancelled' | 'blocked'> {
+  const status = await withSafeSpinner(
     'Checking for interrupted transactions…',
     () => inspectRecovery(context),
     result => result.transactions.length ? `${result.transactions.length} interrupted transaction${result.transactions.length === 1 ? '' : 's'} need review` : 'No interrupted transaction',
     'Recovery status could not be inspected safely.',
+    signal,
+    requestAbort,
   );
   if (status.findings.length) {
     for (const finding of status.findings) log.message(renderFinding(finding));
@@ -207,11 +276,13 @@ async function recoverPending(context: Context, signal: AbortSignal): Promise<'r
       log.message('Recovery was declined; no synchronization was started.');
       return 'blocked';
     }
-    const result = await withSpinner(
+    const result = await withSafeSpinner(
       'Settling the interrupted transaction…',
       () => recoverTransaction(transaction, { confirmed: true, signal }),
       outcome => outcome.status === 'recovered' ? 'Recovery settled' : 'Recovery needs attention',
       'Recovery could not be completed safely.',
+      signal,
+      requestAbort,
     );
     log.message(renderApplyResult(result, 'recovery'));
     if (result.status !== 'recovered') return 'blocked';
@@ -397,6 +468,7 @@ async function chooseAuthorities(
   remembered: AuthorityConfig | undefined,
   existingChoices: Readonly<Record<string, string>>,
   signal: AbortSignal,
+  forceReview = false,
 ): Promise<{ choices: Record<string, string> } | undefined> {
   const selection = resolveSelection(inventory, resourceIds);
   const selected = selectedChoiceMap(existingChoices, selection.resources);
@@ -404,7 +476,18 @@ async function chooseAuthorities(
   for (const finding of preview.findings) {
     if (finding.code.startsWith('REMEMBERED_') || finding.code === 'AUTHORITY_REQUIRED') log.message(renderFinding(finding));
   }
-  for (const conflict of preview.conflicts) {
+  const conflicts = new Map(preview.conflicts.map(conflict => [conflict.key, conflict] as const));
+  if (forceReview) {
+    const groups = new Map<string, ResourceInstance[]>();
+    for (const resource of selection.resources) {
+      const key = authorityKey(resource);
+      const group = groups.get(key) ?? [];
+      group.push(resource);
+      groups.set(key, group);
+    }
+    for (const [key, resources] of groups) if (resources.length > 1) conflicts.set(key, { key, resources });
+  }
+  for (const conflict of conflicts.values()) {
     const candidates = conflict.resources;
     const initial = selected[conflict.key] ?? remembered?.resourceAuthorities[conflict.key];
     while (!signal.aborted) {
@@ -480,10 +563,16 @@ async function choosePlacements(
   kinds: readonly ResourceInstance['kind'][],
   current: Readonly<Partial<Record<AgentId, Placement>>>,
   signal: AbortSignal,
+  forceReview = false,
 ): Promise<Partial<Record<AgentId, Placement>> | undefined> {
   const result: Partial<Record<AgentId, Placement>> = {};
   for (const agentId of agents) {
     const supported = supportedPlacements(agentId, kinds);
+    const existing = current[agentId];
+    if (!forceReview && existing && supported.includes(existing)) {
+      result[agentId] = existing;
+      continue;
+    }
     const options: { value: Placement | null; label: string; hint?: string }[] = [
       { value: null, label: 'Choose a placement…', hint: 'Placement is explicit and may be private.' },
       ...supported.map(placement => ({
@@ -547,6 +636,7 @@ async function reviewPlan(
   state: LoadedState,
   checkedCount: number,
   activeSources: readonly SourceRef[],
+  inventory: Inventory,
   signal: AbortSignal,
 ): Promise<'apply' | 'edit' | 'cancelled' | undefined> {
   log.message(renderPlanReview(plan, state, checkedCount, activeSources));
@@ -565,7 +655,7 @@ async function reviewPlan(
   });
   if (checkCancelled(action) || action === 'cancel') return 'cancelled';
   if (action === 'details') {
-    log.message(renderPlanDetails(plan));
+    log.message(renderPlanDetails(plan, inventory.resources));
     return undefined;
   }
   if (action === 'edit') return 'edit';
@@ -599,7 +689,7 @@ function displayPlanFailure(): void {
   log.error('Planning could not be completed safely. No changes were written.');
 }
 
-export async function runInteractiveFlow(initialContext: Context, signal: AbortSignal): Promise<void> {
+export async function runInteractiveFlow(initialContext: Context, signal: AbortSignal, requestAbort: (reason: Error) => void): Promise<void> {
   let context = initialContext;
   let inventory: Inventory;
   let state: LoadedState;
@@ -615,22 +705,24 @@ export async function runInteractiveFlow(initialContext: Context, signal: AbortS
   let plan: Plan | undefined;
   let stage: FlowStage = 'sources';
   let manageSources = false;
+  let forceAuthorityReview = false;
+  let forcePlacementReview = false;
 
   try {
-    inventory = await discoverInventory(context);
+    const recovery = await recoverPending(context, signal, requestAbort);
+    if (recovery !== 'ready') {
+      if (recovery === 'cancelled') cancel('Cancelled before synchronization; no synchronization files were written.');
+      return;
+    }
+    inventory = await discoverRememberedInventory(context, signal, requestAbort);
     if (inventory.resources.length === 0) {
-      const found = await emptyDiscoveryLoop(context, inventory, signal);
+      const found = await emptyDiscoveryLoop(context, inventory, signal, requestAbort);
       if (!found) {
         cancel('Cancelled before synchronization; no synchronization files were written.');
         return;
       }
       context = found.context;
       inventory = found.inventory;
-    }
-    const recovery = await recoverPending(context, signal);
-    if (recovery !== 'ready') {
-      if (recovery === 'cancelled') cancel('Cancelled before synchronization; no synchronization files were written.');
-      return;
     }
 
 
@@ -661,16 +753,16 @@ export async function runInteractiveFlow(initialContext: Context, signal: AbortS
           const nextContext = action === 'add' ? await addExistingSource(context, signal) : await changeContext(context, signal);
           if (!nextContext) { cancel('Cancelled before synchronization; no synchronization files were written.'); return; }
           if (action === 'context') {
-            const recovery = await recoverPending(nextContext, signal);
+            const recovery = await recoverPending(nextContext, signal, requestAbort);
             if (recovery !== 'ready') {
               if (recovery === 'cancelled') cancel('Cancelled before synchronization; no synchronization files were written.');
               return;
             }
           }
           context = nextContext;
-          inventory = await discoverInventory(context);
+          inventory = await discoverRememberedInventory(context, signal, requestAbort, [configuration]);
           if (inventory.resources.length === 0) {
-            const found = await emptyDiscoveryLoop(context, inventory, signal);
+            const found = await emptyDiscoveryLoop(context, inventory, signal, requestAbort, [configuration]);
             if (!found) { cancel('Cancelled before synchronization; no synchronization files were written.'); return; }
             context = found.context;
             inventory = found.inventory;
@@ -728,10 +820,12 @@ export async function runInteractiveFlow(initialContext: Context, signal: AbortS
       }
 
       if (stage === 'authority') {
-        const choices = await chooseAuthorities(inventory, [...skillIds, ...mcpIds], state.choices, explicitChoices, signal);
+        const revisitingAuthority = forceAuthorityReview;
+        const choices = await chooseAuthorities(inventory, [...skillIds, ...mcpIds], state.choices, explicitChoices, signal, revisitingAuthority);
         if (!choices) { cancel('Cancelled before synchronization; no synchronization files were written.'); return; }
         explicitChoices = choices.choices;
-        stage = 'destinations';
+        forceAuthorityReview = false;
+        stage = revisitingAuthority ? 'plan' : 'destinations';
         continue;
       }
 
@@ -739,16 +833,26 @@ export async function runInteractiveFlow(initialContext: Context, signal: AbortS
         const chosen = await chooseDestinationAgents(inventory, selectedResources(inventory, [...skillIds, ...mcpIds]), destinationAgents, signal);
         if (!chosen) { cancel('Cancelled before synchronization; no synchronization files were written.'); return; }
         if (!chosen.length) return;
+        const kinds = [...new Set(selectedResources(inventory, [...skillIds, ...mcpIds]).map(resource => resource.kind))];
+        const previouslySelected = new Set(destinationAgents);
+        const retainedPlacements: Partial<Record<AgentId, Placement>> = {};
+        for (const agentId of chosen) {
+          const placement = placements[agentId];
+          if (previouslySelected.has(agentId) && placement && supportedPlacements(agentId, kinds).includes(placement)) {
+            retainedPlacements[agentId] = placement;
+          }
+        }
         destinationAgents = chosen;
-        placements = {};
+        placements = retainedPlacements;
         stage = 'placements';
         continue;
       }
 
       if (stage === 'placements') {
         const kinds = [...new Set(selectedResources(inventory, [...skillIds, ...mcpIds]).map(resource => resource.kind))];
-        const chosen = await choosePlacements(destinationAgents, kinds, placements, signal);
+        const chosen = await choosePlacements(destinationAgents, kinds, placements, signal, forcePlacementReview);
         if (!chosen) { cancel('Cancelled before synchronization; no synchronization files were written.'); return; }
+        forcePlacementReview = false;
         placements = chosen;
         stage = 'skill-mode';
         continue;
@@ -788,22 +892,26 @@ export async function runInteractiveFlow(initialContext: Context, signal: AbortS
           configuration,
         };
         try {
-          plan = await withSpinner(
+          plan = await withSafeSpinner(
             'Building a read-only synchronization plan…',
             () => planSync(context, inventory, request, state),
             operationSummary,
             'Planning failed safely.',
+            signal,
+            requestAbort,
           );
         } catch (error) {
           displayPlanFailure();
           return;
         }
         stage = 'plan';
-        const action = await reviewPlan(plan, state, skillIds.length + mcpIds.length, selectedSourceRecords(inventory, sourceIds), signal);
+        const action = await reviewPlan(plan, state, skillIds.length + mcpIds.length, selectedSourceRecords(inventory, sourceIds), inventory, signal);
         if (action === 'cancelled') { cancel('Cancelled before synchronization; no synchronization files were written.'); return; }
         if (action === 'edit') {
           const nextStage = await chooseEditStage(signal);
           if (!nextStage) { cancel('Cancelled before synchronization; no synchronization files were written.'); return; }
+          if (nextStage === 'authority') forceAuthorityReview = true;
+          if (nextStage === 'placements') forcePlacementReview = true;
           if (nextStage === 'sources') manageSources = true;
           stage = nextStage;
           continue;
@@ -822,11 +930,13 @@ export async function runInteractiveFlow(initialContext: Context, signal: AbortS
         }
         let result: ApplyResult;
         try {
-          result = await withSpinner(
+          result = await withSafeSpinner(
             'Applying the confirmed plan…',
             () => applyPlan(plan!, { confirmed: true, signal }),
             outcome => outcome.status === 'applied' ? `${outcome.changed} change${outcome.changed === 1 ? '' : 's'} applied` : outcome.status,
             'Apply did not complete; checking recovery status before reporting.',
+            signal,
+            requestAbort,
           );
         } catch {
           log.error('Apply stopped unexpectedly. Inspect transaction recovery before retrying.');

@@ -4,6 +4,7 @@ import {
   renderApplyResult, renderDiscoverySummary, renderPlanDetails, renderPlanReview,
   renderResourceLabel, renderAuthorityName, sanitizeTerminalText,
 } from '../../src/ui/render.js';
+import { withClackSpinnerExitAbort } from '../../src/ui/flow.js';
 
 const context: Context = {
   projectRoot: '/project',
@@ -57,6 +58,19 @@ it('strips terminal controls and line injection from filesystem-derived labels a
   expect(rendered).toContain('/tmp/source/red line');
 });
 
+it('turns a Clack spinner exit request into an abort and restores process.exit', async () => {
+  const originalExit = process.exit;
+  let abortReason: Error | undefined;
+  const result = await withClackSpinnerExitAbort(async () => {
+    Reflect.apply(process.exit, process, [0]);
+    return 'settled';
+  }, reason => { abortReason = reason; });
+
+  expect(result).toBe('settled');
+  expect(abortReason).toBeInstanceOf(Error);
+  expect(process.exit).toBe(originalExit);
+});
+
 it('keeps credential-bearing MCP definitions and bodies out of safe review projections', () => {
   const secret = 'MCP-CREDENTIAL-BODY-MARKER';
   const mcp: McpResource = {
@@ -78,10 +92,15 @@ it('keeps credential-bearing MCP definitions and bodies out of safe review proje
       unsupportedFields: [],
     },
   };
+  const copilot: McpResource = {
+    ...mcp,
+    id: 'mcp-copilot-id',
+    definition: { ...mcp.definition, nativeAgent: 'github-copilot-cli' },
+  };
   const inventory: Inventory = {
-    resources: [mcp],
+    resources: [mcp, copilot],
     sources: [source],
-    detectedAgents: ['claude-code'],
+    detectedAgents: ['claude-code', 'github-copilot-cli'],
     checkedLocations: [],
     findings: [],
   };
@@ -97,7 +116,7 @@ it('keeps credential-bearing MCP definitions and bodies out of safe review proje
     id: 'plan-id',
     context,
     request: {
-      resourceIds: ['mcp-id'],
+      resourceIds: ['mcp-id', 'mcp-copilot-id'],
       authority: { version: 1, sources: [source], resourceAuthorities: {} },
       destinations: [{ agentId: 'claude-code', placement: 'project' }],
       configuration: 'private-project',
@@ -116,7 +135,10 @@ it('keeps credential-bearing MCP definitions and bodies out of safe review proje
     findings: [],
     summary: {
       authorities: [source],
-      resources: [{ id: 'mcp-id', name: mcp.name, kind: 'mcp' }],
+      resources: [
+        { id: 'mcp-id', name: mcp.name, kind: 'mcp' },
+        { id: 'mcp-copilot-id', name: copilot.name, kind: 'mcp' },
+      ],
       destinations: [{ agentId: 'claude-code', placement: 'project', paths: [hostilePath] }],
       additions: 1,
       updates: 0,
@@ -125,11 +147,17 @@ it('keeps credential-bearing MCP definitions and bodies out of safe review proje
     },
   };
   const applied: ApplyResult = { status: 'applied', changed: 1, unchanged: 0, findings: [] };
+  const claudeView = renderResourceLabel(mcp);
+  const copilotView = renderResourceLabel(copilot);
+  const interpretationDetails = renderPlanDetails(plan, [mcp, copilot]).filter(line => line.includes(mcp.name));
+  expect(claudeView.hint).not.toBe(copilotView.hint);
+  expect(interpretationDetails).toHaveLength(2);
+  expect(interpretationDetails[0]).not.toBe(interpretationDetails[1]);
   const projections = [
     renderResourceLabel(mcp).label,
     ...renderDiscoverySummary(inventory),
     ...renderPlanReview(plan, state, 1, [source]),
-    ...renderPlanDetails(plan),
+    ...renderPlanDetails(plan, [mcp, copilot]),
     ...renderApplyResult(applied),
   ].join(' ');
 

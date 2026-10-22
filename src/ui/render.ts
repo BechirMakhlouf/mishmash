@@ -51,9 +51,10 @@ function sourceAttribution(source: SourceRef): string {
 export function renderResourceLabel(resource: ResourceInstance): { label: string; hint: string } {
   const name = short(resource.name, 70) ?? '(unnamed resource)';
   const description = resource.kind === 'skill' ? short(resource.description, 100) : undefined;
+  const interpretation = resource.kind === 'mcp' ? `${agentLabel(resource.definition.nativeAgent)} interpretation` : undefined;
   return {
     label: description ? `${name} — ${description}` : name,
-    hint: `${sourceAttribution(resource.source)} · ${sourceScopeLabel(resource.source)}`,
+    hint: `${sourceAttribution(resource.source)} · ${interpretation ? `${interpretation} · ` : ''}${sourceScopeLabel(resource.source)}`,
   };
 }
 
@@ -67,7 +68,8 @@ export function renderSourceLabel(source: SourceRef): { label: string; hint: str
 
 function renderResourceLine(resource: ResourceInstance): string {
   const description = resource.kind === 'skill' ? short(resource.description, 80) : undefined;
-  return `  ${resource.kind === 'skill' ? 'Skill' : 'MCP'}: ${short(resource.name, 80) ?? '(unnamed)'}${description ? ` — ${description}` : ''} · ${sourceAttribution(resource.source)} · ${sourceScopeLabel(resource.source)}`;
+  const interpretation = resource.kind === 'mcp' ? ` · ${agentLabel(resource.definition.nativeAgent)} interpretation` : '';
+  return `  ${resource.kind === 'skill' ? 'Skill' : 'MCP'}: ${short(resource.name, 80) ?? '(unnamed)'}${description ? ` — ${description}` : ''} · ${sourceAttribution(resource.source)}${interpretation} · ${sourceScopeLabel(resource.source)}`;
 }
 
 export function renderDiscoverySummary(inventory: Inventory): string[] {
@@ -142,14 +144,19 @@ export function renderPlanReview(plan: Plan, state: LoadedState, checkedCount: n
   return lines;
 }
 
-export function renderPlanDetails(plan: Plan): string[] {
+export function renderPlanDetails(plan: Plan, inventoryResources: readonly ResourceInstance[] = []): string[] {
   const lines = ['Plan details:'];
   for (const operation of plan.operations) {
     lines.push(`  ${operation.kind} · ${sanitizeTerminalText(operation.description)} · ${sanitizeTerminalText(operation.path)}${operation.purpose === 'state' ? ' · generated state' : ''}`);
   }
   if (!plan.operations.length) lines.push('  No filesystem changes are planned.');
   lines.push('Sources and resources:');
-  for (const resource of plan.summary.resources) lines.push(`  ${resource.kind} · ${short(resource.name, 80) ?? '(unnamed)'}`);
+  const resourcesById = new Map(inventoryResources.map(resource => [resource.id, resource] as const));
+  for (const resource of plan.summary.resources) {
+    const instance = resourcesById.get(resource.id);
+    const interpretation = instance?.kind === 'mcp' ? ` · ${agentLabel(instance.definition.nativeAgent)} interpretation` : '';
+    lines.push(`  ${resource.kind} · ${short(resource.name, 80) ?? '(unnamed)'}${interpretation}`);
+  }
   if (!plan.summary.resources.length) lines.push('  No authoritative resources resolved.');
   lines.push('Findings:');
   if (plan.findings.length) lines.push(...plan.findings.map(finding => `  ${renderFinding(finding)}`));

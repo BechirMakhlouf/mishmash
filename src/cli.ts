@@ -75,7 +75,7 @@ export async function main(args = process.argv.slice(2)): Promise<void> {
   process.on('SIGINT', onInterrupt);
   process.on('SIGTERM', onTerminate);
   try {
-    await runInteractiveFlow(createContext(), controller.signal);
+    await runInteractiveFlow(createContext(), controller.signal, reason => controller.abort(reason));
   } finally {
     process.off('SIGINT', onInterrupt);
     process.off('SIGTERM', onTerminate);
