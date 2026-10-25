@@ -1,5 +1,7 @@
 # mishmash
 
+<img width="900" height="900" alt="image" src="https://github.com/user-attachments/assets/5fd46c1c-1e61-41ca-a1e0-fd6e0c963807" />
+
 Sync skills and MCP configurations across your coding agents. Choose a source of truth, select destinations, and review every change before applying it.
 
 Supports [Claude Code](docs/native/claude-code.md), [Codex](docs/native/codex.md), [GitHub Copilot CLI](docs/native/github-copilot-cli.md), [pi](docs/native/pi.md), [OpenCode](docs/native/opencode.md), and [Gemini CLI](docs/native/gemini-cli.md). Capabilities vary by agent; unsupported conversions are flagged, not silently changed.
