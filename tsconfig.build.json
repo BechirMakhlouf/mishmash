@@ -1,0 +1,6 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": { "types": ["node"], "declaration": true, "sourceMap": true },
+  "include": ["src/**/*.ts"],
+  "exclude": ["tests", "vitest.config.ts"]
+}

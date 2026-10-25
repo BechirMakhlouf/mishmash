@@ -1,28 +1,5 @@
-# Dependencies and generated distribution
 node_modules/
 dist/
+coverage/
 *.tgz
 *.tsbuildinfo
-
-# Test and coverage output
-.test-dist/
-coverage/
-.nyc_output/
-test-results/
-playwright-report/
-
-# Local scratch and private runtime data (not committed fixtures)
-.tmp/
-.tmp-*/
-.private/
-private-fixtures/
-.mishmash/
-.agents/state/
-.agents/backups/
-.agents/projects/
-.env
-.env.*
-!.env.example
-npm-debug.log*
-.DS_Store
-Thumbs.db

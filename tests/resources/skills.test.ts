@@ -1,0 +1,63 @@
+import { afterEach, expect, it } from 'vitest';
+import { mkdir, symlink } from 'node:fs/promises';
+import { join } from 'node:path';
+import { snapshotPath } from '../../src/fs/snapshot.js';
+import { discoverSkills, sourceRef } from '../../src/resources/skills.js';
+import { createSandbox, putFile, putSkill, type Sandbox } from '../helpers/sandbox.js';
+
+let sandbox: Sandbox | undefined;
+afterEach(async () => { await sandbox?.cleanup(); });
+it('shares one stable location identity across discovering agents but separates scopes', async () => {
+  sandbox = await createSandbox();
+  const root = join(sandbox.context.projectRoot, '.agents', 'skills');
+  await putSkill(root, 'review');
+  const nativeView = sourceRef('codex', root, 'project', 'shared', 'Codex shared skills');
+  const sharedView = sourceRef('shared', root, 'project', 'shared', 'Shared skills');
+  const userView = sourceRef('shared', root, 'user', 'shared', 'User skills');
+  expect(nativeView.id).toBe(sharedView.id);
+  expect(nativeView.id).not.toBe(userView.id);
+  expect((await discoverSkills(nativeView)).resources[0]?.id).toBe((await discoverSkills(sharedView)).resources[0]?.id);
+});
+it('discovers native metadata and complete assets without mutation', async () => {
+  sandbox = await createSandbox();
+  const root = join(sandbox.context.projectRoot, '.claude', 'skills');
+  const path = await putSkill(root, 'review', 'Review changes safely');
+  await putFile(join(path, 'assets', 'binary'), Buffer.from([0, 1, 255]));
+  await putFile(join(path, 'scripts', 'run'), '#!/bin/sh\n', 0o755);
+  await mkdir(join(path, 'empty'));
+  await symlink('assets/binary', join(path, 'reference'));
+  const before = await snapshotPath(sandbox.root);
+  const source = sourceRef('claude-code', root, 'project', 'shared', 'Claude Code');
+  const result = await discoverSkills(source);
+  expect(result.findings).toEqual([]);
+  expect(result.resources.map(resource => [resource.name, resource.description, resource.path, resource.source.scope])).toEqual([['review', 'Review changes safely', path, 'project']]);
+  expect(result.resources[0]?.snapshot.entries.some(entry => entry.relativePath === 'scripts/run' && entry.mode === 0o755)).toBe(true);
+  expect((await snapshotPath(sandbox.root)).digest).toBe(before.digest);
+});
+it('keeps stable source identities as content changes and reports invalid metadata safely', async () => {
+  sandbox = await createSandbox();
+  const root = join(sandbox.context.projectRoot, 'skills');
+  const path = await putSkill(root, 'review');
+  const source = sourceRef('shared', root, 'project', 'private', 'Existing source');
+  const first = await discoverSkills(source);
+  await putFile(join(path, 'asset'), 'a new asset');
+  const second = await discoverSkills(source);
+  expect(second.resources[0]?.id).toBe(first.resources[0]?.id);
+  expect(second.resources[0]?.snapshot.digest).not.toBe(first.resources[0]?.snapshot.digest);
+  const secret = 'temporary-secret-marker';
+  await putFile(join(path, 'SKILL.md'), `---\nname: [${secret}\n---\n`);
+  const invalid = await discoverSkills(source);
+  expect(invalid.resources).toEqual([]);
+  expect(invalid.findings[0]?.code).toBe('INVALID_SKILL_METADATA');
+  expect(JSON.stringify(invalid.findings).includes(secret)).toBe(false);
+});
+it('blocks skill links escaping the selected source tree', async () => {
+  sandbox = await createSandbox();
+  const root = join(sandbox.context.projectRoot, 'skills');
+  const path = await putSkill(root, 'review');
+  await putFile(join(sandbox.context.homeDir, 'private'), 'outside');
+  await symlink(join(sandbox.context.homeDir, 'private'), join(path, 'escape'));
+  const result = await discoverSkills(sourceRef('shared', root, 'project', 'private', 'Existing source'));
+  expect(result.resources).toEqual([]);
+  expect(result.findings[0]?.code).toBe('UNSAFE_SKILL_LINK');
+});

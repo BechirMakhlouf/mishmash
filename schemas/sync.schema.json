@@ -1,6 +1,0 @@
-{
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "mishmash target selection version 1",
-  "type": "object", "required": ["version", "targets"], "additionalProperties": false,
-  "properties": { "version": { "const": 1 }, "targets": { "type": "array", "uniqueItems": true, "items": { "type": "string", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$" } } }
-}
