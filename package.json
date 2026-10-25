@@ -1,6 +1,7 @@
 {
   "name": "mishmash",
   "version": "0.1.0",
+  "license": "MIT",
   "description": "Discover authoritative agent resources and synchronize selected skills and MCP definitions safely.",
   "type": "module",
   "private": true,
